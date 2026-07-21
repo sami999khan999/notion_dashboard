@@ -50,7 +50,8 @@ notion_dashboard/
 │   ├── phase-4-alert-engine/
 │   ├── phase-5-dashboard-ui/
 │   ├── phase-6-flutter-fcm/
-│   └── phase-7-hardening/
+│   ├── phase-7-hardening/
+│   └── phase-8-auth/
 ├── apps/
 │   ├── worker/              # TanStack Start + Cloudflare Worker (backend + dashboard)
 │   │   ├── src/
@@ -102,10 +103,10 @@ notion_dashboard/
 ## Build order
 
 ```
-0 → 1 → 2 → 3 → (4 ∥ 5) → 6 → 7
+0 → 1 → 2 → 3 → (4 ∥ 5) → 6 → 7 → 8
 ```
 
-The backend, alerts, and dashboard are fully working before the Flutter app exists. Phase 4 alerts run against a **stub `pushFcm`** that logs to `alert_log`, so every rule can be verified without a phone. Phase 6 swaps the stub for the real FCM sender. Phases 4 (alerts) and 5 (dashboard) both read the D1 mirror, so they parallelize once Phase 3 lands.
+The backend, alerts, and dashboard are fully working before the Flutter app exists. Phase 4 alerts run against a **stub `pushFcm`** that logs to `alert_log`, so every rule can be verified without a phone. Phase 6 swaps the stub for the real FCM sender. Phases 4 (alerts) and 5 (dashboard) both read the D1 mirror, so they parallelize once Phase 3 lands. Phase 8 (auth) runs after the dashboard exists (Phase 5) and guards its routes; it can be slotted in earlier if you want the login wall before shipping.
 
 | Phase | Scope | Est. |
 |---|---|---|
@@ -117,4 +118,7 @@ The backend, alerts, and dashboard are fully working before the Flutter app exis
 | 5 | Dashboard UI + charts | 1.5 days |
 | 6 | Flutter app + FCM pipeline | 1.5–2 days |
 | 7 | Hardening | ½–1 day |
-| | **Total** | **~7.5–9 days** |
+| 8 | Authentication (Log in with Notion) | ½–1 day |
+| | **Total** | **~8–10 days** |
+
+**Auth model (Phase 8):** the dashboard is gated by "Log in with Notion" — Notion OAuth for identity, enforced against a **workspace-ID + email allowlist**. Notion has no API to list who can access a database, so workspace membership is the practical proxy for "whoever has access to the databases." The allowlist is the real security control (anyone can authorize a public integration). The cron uses a separate **internal** integration and is unaffected.
