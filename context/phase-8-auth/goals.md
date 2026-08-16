@@ -1,15 +1,30 @@
-# Phase 8 — Authentication (Log in with Notion) · Goals
+# Phase 8 — Authentication (Password + Log in with Notion) · Goals
+
+> **Revised 2026-08-16.** This is now a **personal, single-user** dashboard, so a
+> **password gate is the primary way in**. Notion OAuth is retained as an
+> alternative login path — both routes converge on the same `sessions` table and
+> the same signed cookie, so the route guard, session store, and cookie helpers
+> are shared and unchanged. See §A of `implementation.md` for the password flow.
 
 ## Objective
 
 Put the dashboard behind an identity gate. Today the Cloudflare Worker's
 `fetch()` routes — the Phase 5 dashboard and the Phase 6 `/register` /
 `/test-push` tooling — are reachable by anyone who knows the URL. This phase
-makes them reachable **only by authorized humans**, using **Notion OAuth ("Log
-in with Notion")** for identity and a **workspace-ID + email allowlist** as the
-authorization control.
+makes them reachable **only by authorized humans**, via two interchangeable
+front doors:
 
-The mechanism is:
+- **Password** (primary) — one password, stored only as a **scrypt/PBKDF2 hash**
+  in a Worker secret, verified with a constant-time compare and rate-limited
+  against brute force.
+- **Notion OAuth** (secondary) — "Log in with Notion" for identity, gated by a
+  **workspace-ID + email allowlist**.
+
+Either path issues the same session. Everything downstream — `requireSession`,
+the `sessions` table, cookie signing, logout — is identical regardless of how
+you signed in.
+
+The OAuth mechanism is:
 
 1. A visitor hits any protected route while logged out → they are redirected to
    Notion to authorize a **public** Notion integration (`owner=user`).
@@ -58,6 +73,41 @@ believe you have built more security than you actually have.
 
 If you remember one thing from this document: **the allowlist is mandatory, and
 it — not OAuth — is what keeps strangers out.**
+
+---
+
+## The password gate (primary path)
+
+For a single-user tool the password is the pragmatic front door: no consent
+screen, no public integration metadata, no third party in the login path.
+
+**What it enforces:** possession of one shared secret. That is *weaker* than
+OAuth — it proves knowledge of a string, not identity. It is appropriate here
+precisely because there is exactly one legitimate user and the alternative is a
+URL anyone can open.
+
+Non-negotiables:
+
+- **Store a hash, never the password.** `PASSWORD_HASH` holds
+  `scrypt`/PBKDF2-SHA256 output plus a salt and iteration count. A plaintext
+  `DASHBOARD_PASSWORD` secret is not acceptable — Worker secrets are readable by
+  anyone with dashboard access to the account.
+- **Constant-time comparison.** Reuse the existing `timingSafeEqual` from
+  `cookies.ts`; a `===` on the digest is a timing oracle.
+- **Rate limit by IP.** A KV counter with a short TTL. Without it, one password
+  with no lockout is brute-forceable at whatever rate the Worker will serve.
+- **Generic failure message.** "Incorrect password" and nothing more — no
+  distinction between wrong password and rate-limited, no timing difference.
+- **POST only.** The password never appears in a URL, a referrer, or a log line.
+
+Both paths share one session model, so **logout, expiry, sliding refresh, and
+`requireSession` need no branching.** The `sessions` row records which method was
+used (`auth_method`), for the audit trail only.
+
+**Both doors must be locked.** Adding the password does not make the OAuth
+allowlist optional — an unguarded `/auth/callback` is a bypass around the
+password. If you decide you don't want OAuth at all, delete the routes; do not
+leave them in place with the allowlist relaxed.
 
 ---
 

@@ -1,594 +1,615 @@
-# Phase 4 — Alert Engine + Channels — Implementation
+# Phase 4 — Alert Engine + Email Channel · Implementation
 
-This document contains the concrete types, SQL, and code for the alert engine. All code lives under `apps/worker/src/alerts/`. Everything runs inside the Cloudflare Worker's `scheduled()` handler, after the Phase 3 upsert.
+> **Revised 2026-08-16** for the email-only, personal-use direction. Rules E1–E9
+> replace the old A1–A7. Read `context/notion-schema.md` first.
 
-## Table of contents
+- **New code lives in:** `apps/worker/src/alerts/`
+- **Schema addition:** `apps/worker/schema.sql`
+- **Runtime:** Cloudflare Worker `scheduled()`, cron `* * * * *`
+- **All stored timestamps are ISO 8601 UTC.** Only display and window math are local.
 
-1. [The `Alert` type and `Env`](#the-alert-type-and-env)
-2. [Time zones and day boundaries](#time-zones-and-day-boundaries)
-3. [The seven rule functions](#the-seven-rule-functions)
-4. [The dispatcher](#the-dispatcher)
-5. [`recordSent`, `sendEmail`, stub `pushFcm`](#channels-and-logging)
-6. [A4 edge-trigger coordination with Phase 3](#a4-edge-trigger-coordination-with-phase-3)
-7. [Threshold semantics](#threshold-semantics)
-8. [Testing](#testing)
-9. [Pitfalls](#pitfalls)
-
----
-
-## The `Alert` type and `Env`
-
-```ts
-// apps/worker/src/alerts/types.ts
-
-export type AlertRule = "A1" | "A2" | "A3" | "A4" | "A5" | "A6" | "A7";
-export type AlertChannel = "push" | "email";
-
-export interface Alert {
-  rule: AlertRule;
-  /** Id of the entity the alert is about (timer/task/routine id, or a synthetic key). */
-  entityId: string;
-  /** Discriminator so one rule can fire at multiple tiers. Part of the dedupe key. */
-  threshold: string;
-  channel: AlertChannel;
-  /** Push title / email subject. */
-  title: string;
-  /** Push body. */
-  body: string;
-  /** Email HTML body (only used when channel === "email"). */
-  html: string;
-  /** Deep link back into Notion; passed as push data. */
-  notionUrl: string;
-}
-
-export interface Env {
-  DB: D1Database;
-  // Resend (email channel)
-  RESEND_API_KEY: string;
-  ALERT_FROM: string;   // e.g. "Ops Dashboard <alerts@yourdomain.com>"
-  ALERT_TO: string;     // recipient
-  // Local time zone used to compute "today" / "21:00" / "end-of-day" boundaries.
-  ALERT_TZ: string;     // e.g. "Asia/Riyadh"
-  // Focus target in seconds/day (A7); may later move to the goals table.
-  FOCUS_TARGET_SECONDS?: string; // default handled in code, e.g. "14400" (4h)
-}
+```
+apps/worker/src/alerts/
+├── types.ts        Alert, Snapshot, RuleContext
+├── time.ts         Asia/Dhaka helpers — the file to get right
+├── rules/
+│   ├── timer.ts    E1 E2 E3
+│   ├── deadline.ts E4 E5 E6 E7
+│   └── routine.ts  E8 E9
+├── dispatch.ts     runAlertRules, dedupe, quiet hours, recordSent
+└── email.ts        Resend sender + HTML templates
 ```
 
 ---
 
-## Time zones and day boundaries
+## 1. Config
 
-**Rule: store everything in UTC.** Every `sent_at`, `start_time`, `deadline`, and transaction date in D1 is ISO 8601 UTC. That never changes.
+`wrangler.jsonc` vars (none of these are secret):
 
-But several rules reason about **human day boundaries** — "today", "the next 24 hours", "21:00", "end-of-day". Those are inherently local. If we naively used SQLite's `date('now')` (which is UTC), then late-evening local activity would be attributed to the wrong day and A5/A7 would fire at the wrong moment.
+```jsonc
+{
+  "vars": {
+    "ALERT_TZ_OFFSET_MINUTES": "360",       // Asia/Dhaka, +06:00, no DST
+    "ALERT_MAX_LATENESS_MIN": "10",         // don't fire a block start >10 min late
+    "ALERT_DEADLINE_STALE_HOURS": "24",     // don't fire E4/E5/E6 for long-past deadlines
+    "ALERT_MISSED_GRACE_MIN": "60",         // E7 waits this long after the deadline
+    "ALERT_QUIET_HOURS": "",                // e.g. "00:00-07:45"; empty = disabled
+    "DIGEST_AT": "07:45",                   // E9 send time, local
 
-So we make the local zone **configurable via `env.ALERT_TZ`** and compute the local "today" once per run, then pass concrete UTC instants into the SQL. The cleanest approach on Workers is to compute boundary instants in JS (using `Intl`) and bind them as parameters, rather than relying on SQLite timezone modifiers.
+    "ALERT_TIMER_START": "true",            // E1
+    "ALERT_TIMER_TICK": "true",             // E2
+    "ALERT_TIMER_END": "true",              // E3
+    "ALERT_TIMER_TICK_MINUTES": "30",       // E2 interval
+    "ALERT_DEADLINE_24H": "true",           // E4
+    "ALERT_DEADLINE_1H": "true",            // E5
+    "ALERT_DEADLINE_HIT": "true",           // E6
+    "ALERT_DEADLINE_MISSED": "true",        // E7 — on by default, see goals.md
+    "ALERT_DEADLINE_MISSED_RENAG": "true",  // E7 once/day vs once ever
+    "ALERT_ROUTINE_START": "true",          // E8
+    "ALERT_ROUTINE_DIGEST": "false"         // E9
+  }
+}
+```
+
+Secrets (`wrangler secret put`): `RESEND_API_KEY`, `ALERT_FROM`, `ALERT_TO`.
 
 ```ts
-// apps/worker/src/alerts/time.ts
-
-/** Returns the local calendar date (YYYY-MM-DD) for `now` in the given IANA tz. */
-export function localDateStr(now: Date, tz: string): string {
-  // en-CA gives ISO-like YYYY-MM-DD formatting.
-  return new Intl.DateTimeFormat("en-CA", {
-    timeZone: tz,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  }).format(now);
+// alerts/types.ts
+export interface Alert {
+  rule: string;           // "E1".."E9"
+  entityId: string;       // Notion page id, or a synthetic id for digests
+  threshold: string;      // dedupe discriminator — see the rule table
+  subject: string;
+  html: string;
+  notionUrl?: string;
 }
 
-/** Returns the local wall-clock hour (0-23) for `now` in the given tz. */
-export function localHour(now: Date, tz: string): number {
-  return Number(
-    new Intl.DateTimeFormat("en-GB", {
-      timeZone: tz,
-      hour: "2-digit",
-      hour12: false,
-    }).format(now)
-  );
+export interface RuleContext {
+  env: Env;
+  now: Date;              // injected, never Date.now() inside a rule — keeps rules testable
+}
+```
+
+Every rule is `(ctx, rows) => Alert[]`. **No rule calls the network, reads the
+clock, or writes to D1.** `now` is passed in so tests can freeze it.
+
+---
+
+## 2. `time.ts` — the file that decides whether this works
+
+Asia/Dhaka is **UTC+6 with no DST**, so a fixed offset is correct year-round and
+avoids `Intl` entirely. The trick: shift the instant by the offset, then read
+**UTC** accessors — those now report local wall-clock.
+
+```ts
+// alerts/time.ts
+export function offsetMin(env: Env): number {
+  return Number(env.ALERT_TZ_OFFSET_MINUTES ?? 360);
+}
+
+/** Shift an instant so that getUTC* accessors return local wall-clock fields. */
+function shifted(d: Date, off: number): Date {
+  return new Date(d.getTime() + off * 60_000);
+}
+
+/** Local weekday name, e.g. "Monday" — matches the routine `Days` multi-select. */
+const DAY_NAMES = ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"];
+export function localWeekday(d: Date, off: number): string {
+  return DAY_NAMES[shifted(d, off).getUTCDay()];
+}
+
+/** Local calendar date as YYYY-MM-DD. */
+export function localDate(d: Date, off: number): string {
+  return shifted(d, off).toISOString().slice(0, 10);
+}
+
+/** Minutes since local midnight, 0..1439. */
+export function localMinutes(d: Date, off: number): number {
+  const s = shifted(d, off);
+  return s.getUTCHours() * 60 + s.getUTCMinutes();
+}
+
+/** Local "HH:MM" of an instant. */
+export function localHHMM(d: Date, off: number): string {
+  const m = localMinutes(d, off);
+  return `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
+}
+
+/** Build the UTC instant for a local wall-clock date + minutes-since-midnight. */
+export function fromLocal(dateYMD: string, minutes: number, off: number): Date {
+  const base = Date.parse(`${dateYMD}T00:00:00.000Z`);
+  return new Date(base + minutes * 60_000 - off * 60_000);
+}
+
+/** Parse "HH:MM" → minutes since midnight. Returns null if malformed. */
+export function parseHHMM(s: string): number | null {
+  const m = /^\s*(\d{1,2}):(\d{2})\s*$/.exec(s);
+  if (!m) return null;
+  const h = Number(m[1]), mi = Number(m[2]);
+  if (h > 23 || mi > 59) return null;
+  return h * 60 + mi;
+}
+
+/** Parse a routine `Time` value, "HH:MM - HH:MM" → [startMin, endMin]. */
+export function parseWindow(time: string): [number, number] | null {
+  const parts = (time ?? "").split("-");
+  if (parts.length !== 2) return null;
+  const a = parseHHMM(parts[0]), b = parseHHMM(parts[1]);
+  return a == null || b == null ? null : [a, b];
+}
+
+export function fmtDuration(seconds: number): string {
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = seconds % 60;
+  return [h && `${h}h`, m && `${m}m`, (!h && !m) && `${s}s`].filter(Boolean).join(" ");
+}
+```
+
+> **Why not `Intl.DateTimeFormat` with `timeZone: "Asia/Dhaka"`?** It works on
+> Workers, but it is slower, allocation-heavy at one call per row per tick, and
+> returns strings you have to re-parse. A fixed offset is exact here **because
+> Bangladesh observes no DST**. If you ever point this at a DST zone, swap
+> `shifted()` for an `Intl`-based implementation and every caller keeps working.
+
+---
+
+## 3. Schema additions
+
+Append to `apps/worker/schema.sql` (idempotent, re-appliable):
+
+```sql
+-------------------------------------------------------------------------------
+-- Phase 4 (revised): timer notification bookkeeping
+-------------------------------------------------------------------------------
+-- Highest 30-minute bucket already emailed for a running timer. Survives Worker
+-- restarts, so E2 never replays buckets after a redeploy.
+ALTER TABLE timer_snapshot ADD COLUMN notified_bucket INTEGER DEFAULT 0;
+
+-- Phase 3 writes the pre-upsert status/end_time here so E1/E3 can see the edge.
+CREATE TABLE IF NOT EXISTS timer_prev (
+  notion_id  TEXT PRIMARY KEY,
+  status     TEXT,
+  end_time   TEXT,
+  seen_at    TEXT NOT NULL
+);
+```
+
+`ALTER TABLE ... ADD COLUMN` is not idempotent in SQLite — it errors if the
+column exists. Either guard it in the migration runner or keep it in a separate
+`migrations/004_notified_bucket.sql` applied once. Phase 7 formalises migrations.
+
+---
+
+## 4. E1 / E2 / E3 — timer lifecycle
+
+```ts
+// alerts/rules/timer.ts
+import type { Alert, RuleContext } from "../types";
+import { fmtDuration, localHHMM, offsetMin } from "../time";
+
+export interface TimerRow {
+  notion_id: string;
+  name: string;
+  status: string | null;        // "Running" | "Stoped"
+  start_time: string | null;    // ISO
+  end_time: string | null;      // ISO
+  notified_bucket: number;
+  task_title?: string | null;
+}
+export interface TimerPrev { status: string | null; end_time: string | null }
+
+const url = (id: string) => `https://www.notion.so/${id.replace(/-/g, "")}`;
+const isRunning = (r: TimerRow) => r.status === "Running" && !r.end_time;
+
+/** E1 — a timer we have not seen running before is now running. */
+export function ruleTimerStarted(
+  ctx: RuleContext, rows: TimerRow[], prev: Map<string, TimerPrev>,
+): Alert[] {
+  if (ctx.env.ALERT_TIMER_START !== "true") return [];
+  const off = offsetMin(ctx.env);
+  const out: Alert[] = [];
+  for (const r of rows) {
+    if (!isRunning(r) || !r.start_time) continue;
+    const p = prev.get(r.notion_id);
+    // Fire when previously absent (first sight) or previously not running.
+    if (p && p.status === "Running" && !p.end_time) continue;
+    const started = new Date(r.start_time);
+    out.push({
+      rule: "E1",
+      entityId: r.notion_id,
+      threshold: "start",
+      subject: `▶ Started: ${r.name || "Untitled timer"}`,
+      html: card("Timer started", [
+        ["Activity", r.name || "—"],
+        ["Task", r.task_title ?? "—"],
+        ["Started at", localHHMM(started, off)],
+      ], url(r.notion_id)),
+      notionUrl: url(r.notion_id),
+    });
+  }
+  return out;
 }
 
 /**
- * Given a local date string (YYYY-MM-DD) and tz, return the UTC ISO instant
- * for local midnight (00:00:00) of that day. Used as the lower bound of "today".
+ * E2 — every N minutes while a timer runs.
+ * Emits only the CURRENT highest bucket. If ticks were missed, intermediate
+ * buckets are skipped rather than burst-sent.
  */
-export function localMidnightUtc(localDate: string, tz: string): string {
-  // Find the offset for this tz at roughly this date by formatting a probe instant.
-  const probe = new Date(`${localDate}T12:00:00Z`);
-  const tzName = new Intl.DateTimeFormat("en-US", {
-    timeZone: tz,
-    timeZoneName: "shortOffset",
-  })
-    .formatToParts(probe)
-    .find((p) => p.type === "timeZoneName")?.value ?? "GMT+0";
-  // tzName looks like "GMT+3" or "GMT+5:30"; parse into minutes.
-  const m = /GMT([+-]\d{1,2})(?::(\d{2}))?/.exec(tzName);
-  const offH = m ? Number(m[1]) : 0;
-  const offM = m ? Number(m[2] ?? "0") * Math.sign(offH || 1) : 0;
-  const offsetMinutes = offH * 60 + (offH < 0 ? -Number(m?.[2] ?? 0) : offM);
-  // local midnight in UTC = local 00:00 minus offset.
-  const utc = new Date(`${localDate}T00:00:00Z`).getTime() - offsetMinutes * 60_000;
-  return new Date(utc).toISOString();
+export function ruleTimerTick(ctx: RuleContext, rows: TimerRow[]): Alert[] {
+  if (ctx.env.ALERT_TIMER_TICK !== "true") return [];
+  const step = Number(ctx.env.ALERT_TIMER_TICK_MINUTES ?? 30);
+  const out: Alert[] = [];
+  for (const r of rows) {
+    if (!isRunning(r) || !r.start_time) continue;
+    const elapsedMin = Math.floor((ctx.now.getTime() - Date.parse(r.start_time)) / 60_000);
+    if (elapsedMin < step) continue;
+    const bucket = Math.floor(elapsedMin / step);
+    if (bucket <= r.notified_bucket) continue;      // already emailed this bucket
+    const mins = bucket * step;
+    out.push({
+      rule: "E2",
+      entityId: r.notion_id,
+      threshold: `${mins}m`,
+      subject: `⏳ ${fmtDuration(mins * 60)} on: ${r.name || "Untitled timer"}`,
+      html: card("Timer still running", [
+        ["Activity", r.name || "—"],
+        ["Elapsed", fmtDuration(elapsedMin * 60)],
+        ["Started", localHHMM(new Date(r.start_time), offsetMin(ctx.env))],
+      ], url(r.notion_id)),
+      notionUrl: url(r.notion_id),
+    });
+  }
+  return out;
+}
+
+/** E3 — a timer that was running has stopped. */
+export function ruleTimerEnded(
+  ctx: RuleContext, rows: TimerRow[], prev: Map<string, TimerPrev>,
+): Alert[] {
+  if (ctx.env.ALERT_TIMER_END !== "true") return [];
+  const off = offsetMin(ctx.env);
+  const out: Alert[] = [];
+  for (const r of rows) {
+    const p = prev.get(r.notion_id);
+    const wasRunning = p && p.status === "Running" && !p.end_time;
+    if (!wasRunning || isRunning(r)) continue;
+    // Notion's Total Time In Seconds is 0 until End Time exists — compute it here.
+    const secs = r.start_time && r.end_time
+      ? Math.max(0, Math.round((Date.parse(r.end_time) - Date.parse(r.start_time)) / 1000))
+      : 0;
+    out.push({
+      rule: "E3",
+      entityId: r.notion_id,
+      threshold: "end",
+      subject: `⏹ Finished: ${r.name || "Untitled timer"} — ${fmtDuration(secs)}`,
+      html: card("Timer ended", [
+        ["Activity", r.name || "—"],
+        ["Duration", fmtDuration(secs)],
+        ["Started", r.start_time ? localHHMM(new Date(r.start_time), off) : "—"],
+        ["Ended", r.end_time ? localHHMM(new Date(r.end_time), off) : "—"],
+      ], url(r.notion_id)),
+      notionUrl: url(r.notion_id),
+    });
+  }
+  return out;
 }
 ```
 
-> Keep the boundary math in one place. If DST correctness ever matters for the chosen zone, this is the single file to harden. For a fixed-offset zone (the common case for a single-user dashboard) the above is exact. The rules below take pre-computed boundary instants as inputs so the SQL stays simple.
+After a successful E2 dispatch the dispatcher persists the bucket:
 
-A small helper computes the boundaries once per run and threads them through:
-
-```ts
-// apps/worker/src/alerts/context.ts
-import { localDateStr, localHour, localMidnightUtc } from "./time";
-
-export interface RunCtx {
-  nowIso: string;         // current instant, UTC ISO
-  localDate: string;      // e.g. "2026-07-21"
-  localHour: number;      // 0-23
-  todayStartUtc: string;  // UTC ISO of local midnight today
-  todayEndUtc: string;    // UTC ISO of local midnight tomorrow (exclusive)
-  next24hUtc: string;     // nowIso + 24h
-  threeHoursAgoUtc: string;
-  monthPrefix: string;    // "2026-07" for month grouping
-}
-
-export function makeCtx(env: Env, now = new Date()): RunCtx {
-  const tz = env.ALERT_TZ;
-  const localDate = localDateStr(now, tz);
-  const todayStartUtc = localMidnightUtc(localDate, tz);
-  const todayEndUtc = new Date(
-    new Date(todayStartUtc).getTime() + 24 * 3600_000
-  ).toISOString();
-  return {
-    nowIso: now.toISOString(),
-    localDate,
-    localHour: localHour(now, tz),
-    todayStartUtc,
-    todayEndUtc,
-    next24hUtc: new Date(now.getTime() + 24 * 3600_000).toISOString(),
-    threeHoursAgoUtc: new Date(now.getTime() - 3 * 3600_000).toISOString(),
-    monthPrefix: localDate.slice(0, 7),
-  };
-}
+```sql
+UPDATE timer_snapshot SET notified_bucket = ? WHERE notion_id = ?;
 ```
+
+`notified_bucket` resets to 0 naturally because a *new* timer is a new row.
 
 ---
 
-## The seven rule functions
+## 5. E4 / E5 / E6 / E7 — deadlines
 
-All rules are pure reads. Each returns `Alert[]`. Schemas assumed from Phase 2 are noted inline.
+Two shapes of `Deadline` exist in the data and they must be handled differently:
 
-### A1 — Orphan timer (push, high)
-
-`timer_snapshot(id, status, start_time, end_time, notion_url, ...)`. Fire when running, started > 3h ago, no end time.
-
-```ts
-// apps/worker/src/alerts/rules/a1_orphanTimer.ts
-import type { Alert, Env } from "../types";
-import type { RunCtx } from "../context";
-
-export async function ruleOrphanTimer(env: Env, ctx: RunCtx): Promise<Alert[]> {
-  const { results } = await env.DB.prepare(
-    `SELECT id, start_time, notion_url
-       FROM timer_snapshot
-      WHERE status = 'Running'
-        AND (end_time IS NULL OR end_time = '')
-        AND start_time < ?`      -- older than 3h ago
-  ).bind(ctx.threeHoursAgoUtc).all<{ id: string; start_time: string; notion_url: string }>();
-
-  return (results ?? []).map((r) => ({
-    rule: "A1",
-    entityId: r.id,
-    threshold: "1",
-    channel: "push",
-    title: "Orphan timer still running",
-    body: `A timer has been running since ${r.start_time} (>3h). Did you forget to stop it?`,
-    html: "",
-    notionUrl: r.notion_url,
-  }));
-}
-```
-
-### A2 — Task overdue (push)
-
-`task_snapshot(id, name, deadline, completed, archived, notion_url, ...)`. Deadline before local today, not completed, not archived.
+| Stored value | Length | Meaning | Deadline instant |
+|---|---|---|---|
+| `2026-03-31T00:00:00.000+06:00` | > 10 | exact moment | as given |
+| `2026-02-22` | **10** | the whole day | local **23:59:59** of that day |
 
 ```ts
-// apps/worker/src/alerts/rules/a2_overdue.ts
-import type { Alert, Env } from "../types";
-import type { RunCtx } from "../context";
+// alerts/rules/deadline.ts
+import type { Alert, RuleContext } from "../types";
+import { fromLocal, localDate, offsetMin } from "../time";
 
-export async function ruleOverdue(env: Env, ctx: RunCtx): Promise<Alert[]> {
-  // deadline strictly before start of local "today"
-  const { results } = await env.DB.prepare(
-    `SELECT id, name, deadline, notion_url
-       FROM task_snapshot
-      WHERE completed = 0
-        AND archived = 0
-        AND deadline IS NOT NULL
-        AND deadline <> ''
-        AND deadline < ?`
-  ).bind(ctx.todayStartUtc).all<{ id: string; name: string; deadline: string; notion_url: string }>();
-
-  return (results ?? []).map((r) => ({
-    rule: "A2",
-    entityId: r.id,
-    threshold: "1",
-    channel: "push",
-    title: "Task overdue",
-    body: `"${r.name}" was due ${r.deadline} and isn't done.`,
-    html: "",
-    notionUrl: r.notion_url,
-  }));
-}
-```
-
-> If `deadline` is stored as a date-only string (`YYYY-MM-DD`) rather than a full instant, compare against `ctx.localDate` instead: `deadline < ?` bound to `ctx.localDate`. Pick one representation in Phase 2 and be consistent. The examples here assume full UTC instants; date-only variants are noted per rule.
-
-### A3 — Deadline soon (push)
-
-Deadline within the next 24h and not completed.
-
-```ts
-// apps/worker/src/alerts/rules/a3_deadlineSoon.ts
-import type { Alert, Env } from "../types";
-import type { RunCtx } from "../context";
-
-export async function ruleDeadlineSoon(env: Env, ctx: RunCtx): Promise<Alert[]> {
-  const { results } = await env.DB.prepare(
-    `SELECT id, name, deadline, notion_url
-       FROM task_snapshot
-      WHERE completed = 0
-        AND deadline IS NOT NULL
-        AND deadline <> ''
-        AND deadline >= ?      -- from now
-        AND deadline <  ?`     -- to now + 24h
-  ).bind(ctx.nowIso, ctx.next24hUtc)
-   .all<{ id: string; name: string; deadline: string; notion_url: string }>();
-
-  return (results ?? []).map((r) => ({
-    rule: "A3",
-    entityId: r.id,
-    threshold: "1",
-    channel: "push",
-    title: "Deadline soon",
-    body: `"${r.name}" is due within 24h (${r.deadline}).`,
-    html: "",
-    notionUrl: r.notion_url,
-  }));
-}
-```
-
-### A4 — Routine block starting (push, edge-triggered)
-
-`routine_snapshot(id, name, active_now, prev_active_now, today, done, notion_url, ...)`. Fire on `prev_active_now = 0 AND active_now = 1`. See the [coordination section](#a4-edge-trigger-coordination-with-phase-3) for how `prev_active_now` gets populated.
-
-```ts
-// apps/worker/src/alerts/rules/a4_routineStart.ts
-import type { Alert, Env } from "../types";
-import type { RunCtx } from "../context";
-
-export async function ruleRoutineStart(env: Env, ctx: RunCtx): Promise<Alert[]> {
-  const { results } = await env.DB.prepare(
-    `SELECT id, name, notion_url
-       FROM routine_snapshot
-      WHERE active_now = 1
-        AND (prev_active_now IS NULL OR prev_active_now = 0)`
-  ).bind().all<{ id: string; name: string; notion_url: string }>();
-
-  return (results ?? []).map((r) => ({
-    rule: "A4",
-    entityId: r.id,
-    // Include the local date so a block that recurs daily re-arms each day.
-    threshold: ctx.localDate,
-    channel: "push",
-    title: "Routine block starting",
-    body: `"${r.name}" is starting now.`,
-    html: "",
-    notionUrl: r.notion_url,
-  }));
-}
-```
-
-> Two layers protect against re-fire: the SQL edge condition (`prev = 0, now = 1`) and the dedupe key. The edge condition means we only emit on the rising tick; the dedupe key (`A4`, routine id, local date) guarantees at-most-once even if two cron ticks somehow both observe the edge.
-
-### A5 — Routine missed (email digest)
-
-At end-of-day, routines with `today = 1 AND done = 0`. "End-of-day" is gated in JS on `ctx.localHour`; the SQL just selects the missed routines. Emitted as a **single digest email** (one `Alert` covering all misses) rather than one per routine.
-
-```ts
-// apps/worker/src/alerts/rules/a5_routineMissed.ts
-import type { Alert, Env } from "../types";
-import type { RunCtx } from "../context";
-
-const END_OF_DAY_HOUR = 23; // local hour at/after which we consider the day "done"
-
-export async function ruleRoutineMissed(env: Env, ctx: RunCtx): Promise<Alert[]> {
-  if (ctx.localHour < END_OF_DAY_HOUR) return []; // only near end-of-day
-
-  const { results } = await env.DB.prepare(
-    `SELECT id, name, notion_url
-       FROM routine_snapshot
-      WHERE today = 1
-        AND done  = 0
-      ORDER BY name`
-  ).bind().all<{ id: string; name: string; notion_url: string }>();
-
-  const missed = results ?? [];
-  if (missed.length === 0) return [];
-
-  const items = missed.map((r) => `<li>${escapeHtml(r.name)}</li>`).join("");
-  const html =
-    `<h2>Routines missed on ${ctx.localDate}</h2>` +
-    `<p>You planned these routines today but didn't complete them:</p>` +
-    `<ul>${items}</ul>`;
-
-  return [{
-    rule: "A5",
-    // One digest per day → entityId is the date, threshold is the date too.
-    entityId: `digest-${ctx.localDate}`,
-    threshold: ctx.localDate,
-    channel: "email",
-    title: `Routines missed on ${ctx.localDate}`,
-    body: `${missed.length} routine(s) missed today.`,
-    html,
-    notionUrl: "",
-  }];
+export interface TaskRow {
+  notion_id: string;
+  title: string;
+  deadline: string | null;   // raw Notion value — precision preserved
+  completed: number;
+  archived: number;
 }
 
-function escapeHtml(s: string): string {
-  return s.replace(/[&<>"']/g, (c) =>
-    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]!));
+const url = (id: string) => `https://www.notion.so/${id.replace(/-/g, "")}`;
+const isDateOnly = (d: string) => d.length === 10;
+
+/** Resolve a raw Notion deadline to a UTC instant. */
+function deadlineInstant(raw: string, off: number): Date {
+  return isDateOnly(raw)
+    ? fromLocal(raw, 23 * 60 + 59, off)   // end of that local day
+    : new Date(raw);
 }
-```
 
-### A6 — Budget threshold (push + email, two tiers)
+export function ruleDeadlines(ctx: RuleContext, rows: TaskRow[]): Alert[] {
+  const env = ctx.env, off = offsetMin(env), now = ctx.now.getTime();
+  const staleMs = Number(env.ALERT_DEADLINE_STALE_HOURS ?? 24) * 3_600_000;
+  const graceMs = Number(env.ALERT_MISSED_GRACE_MIN ?? 60) * 60_000;
+  const out: Alert[] = [];
 
-`txn_snapshot(id, type, amount, occurred_at, ...)` summed for the current month; `goals(key, amount)` holds the Expense Goal. Emits an independent candidate per tier (`"80"`, `"100"`) and per channel.
+  for (const r of rows) {
+    if (!r.deadline || r.completed || r.archived) continue;
+    const dueAt = deadlineInstant(r.deadline, off).getTime();
+    const dateOnly = isDateOnly(r.deadline);
+    const when = new Date(dueAt).toISOString();
 
-```ts
-// apps/worker/src/alerts/rules/a6_budget.ts
-import type { Alert, Env } from "../types";
-import type { RunCtx } from "../context";
-
-export async function ruleBudget(env: Env, ctx: RunCtx): Promise<Alert[]> {
-  // Current-month expense sum. occurred_at is UTC ISO; group by local month prefix.
-  // If occurred_at is a full instant, filter on the local month window instead of substr.
-  const row = await env.DB.prepare(
-    `SELECT COALESCE(SUM(amount), 0) AS spent
-       FROM txn_snapshot
-      WHERE type = 'Expense'
-        AND occurred_at >= ?      -- start of local month
-        AND occurred_at <  ?`     -- start of next local month
-  ).bind(monthStartUtc(ctx), monthEndUtc(ctx)).first<{ spent: number }>();
-
-  const goalRow = await env.DB.prepare(
-    `SELECT amount FROM goals WHERE key = 'Expense Goal' LIMIT 1`
-  ).first<{ amount: number }>();
-
-  const spent = row?.spent ?? 0;
-  const goal = goalRow?.amount ?? 0;
-  if (goal <= 0) return []; // no goal configured → nothing to compare
-
-  const pct = (spent / goal) * 100;
-  const alerts: Alert[] = [];
-
-  const tiers: Array<{ threshold: "80" | "100"; at: number }> = [
-    { threshold: "80", at: 80 },
-    { threshold: "100", at: 100 },
-  ];
-
-  for (const t of tiers) {
-    if (pct >= t.at) {
-      // Entity id encodes the month so each month re-arms independently.
-      const entityId = `expense-${ctx.monthPrefix}`;
-      const title = `Budget ${t.threshold}% reached`;
-      const body =
-        `Expenses this month: ${spent.toFixed(2)} / ${goal.toFixed(2)} ` +
-        `(${pct.toFixed(0)}%).`;
-      const html = `<h2>${title}</h2><p>${body}</p>`;
-      // Fire on BOTH channels; dedupe key differs by channel via threshold suffix.
-      alerts.push({
-        rule: "A6", entityId, threshold: `${t.threshold}`, channel: "push",
-        title, body, html, notionUrl: "",
+    const push = (rule: string, threshold: string, subject: string, label: string) =>
+      out.push({
+        rule, entityId: r.notion_id, threshold, subject,
+        html: card(label, [
+          ["Task", r.title || "—"],
+          ["Deadline", dateOnly ? r.deadline : new Date(dueAt).toISOString()],
+        ], url(r.notion_id)),
+        notionUrl: url(r.notion_id),
       });
-      alerts.push({
-        rule: "A6", entityId, threshold: `${t.threshold}-email`, channel: "email",
-        title, body, html, notionUrl: "",
-      });
+
+    // --- E4: 24 hours out -------------------------------------------------
+    // Date-only deadlines anchor to 09:00 the previous local day instead of
+    // 23:59 the previous day, which would be a useless midnight ping.
+    if (env.ALERT_DEADLINE_24H === "true") {
+      const fireAt = dateOnly
+        ? fromLocal(localDate(new Date(dueAt - 86_400_000), off), 9 * 60, off).getTime()
+        : dueAt - 86_400_000;
+      // Only while still upcoming, and not for deadlines already long past.
+      if (now >= fireAt && now < dueAt && now - fireAt < staleMs) {
+        push("E4", "24h", `⏰ Due in 24h: ${r.title}`, "Deadline approaching");
+      }
+    }
+
+    // --- E5: 1 hour out — meaningless for a date-only deadline ------------
+    if (env.ALERT_DEADLINE_1H === "true" && !dateOnly) {
+      const fireAt = dueAt - 3_600_000;
+      if (now >= fireAt && now < dueAt && now - fireAt < staleMs) {
+        push("E5", "1h", `⏰ Due in 1 hour: ${r.title}`, "Deadline in one hour");
+      }
+    }
+
+    // --- E6: the deadline itself -----------------------------------------
+    if (env.ALERT_DEADLINE_HIT === "true") {
+      if (now >= dueAt && now - dueAt < staleMs) {
+        push("E6", "hit", `🔔 Deadline reached: ${r.title}`, "Deadline reached");
+      }
+    }
+
+    // --- E7: missed -------------------------------------------------------
+    if (env.ALERT_DEADLINE_MISSED === "true" && now >= dueAt + graceMs) {
+      // Date in the threshold ⇒ one nag per day. Without it, one nag ever.
+      const threshold = env.ALERT_DEADLINE_MISSED_RENAG === "true"
+        ? `missed:${localDate(ctx.now, off)}`
+        : "missed";
+      const daysLate = Math.floor((now - dueAt) / 86_400_000);
+      push("E7", threshold,
+        `❗ Overdue${daysLate > 0 ? ` by ${daysLate}d` : ""}: ${r.title}`,
+        "Deadline missed");
     }
   }
-  return alerts;
-}
-
-function monthStartUtc(ctx: RunCtx): string {
-  // ctx.monthPrefix is "YYYY-MM"; local first-of-month midnight → UTC.
-  // Reuse localMidnightUtc on the first day of the month.
-  return new Date(`${ctx.monthPrefix}-01T00:00:00Z`).toISOString();
-}
-function monthEndUtc(ctx: RunCtx): string {
-  const [y, m] = ctx.monthPrefix.split("-").map(Number);
-  const nextY = m === 12 ? y + 1 : y;
-  const nextM = m === 12 ? 1 : m + 1;
-  const mm = String(nextM).padStart(2, "0");
-  return new Date(`${nextY}-${mm}-01T00:00:00Z`).toISOString();
+  return out;
 }
 ```
 
-> **Two-tier + two-channel dedupe.** The `threshold` string carries both the tier and (for email) a `-email` suffix so that the composite key `(A6, entity, threshold)` is distinct for each of the four possible sends: push-80, email-80, push-100, email-100. Each fires at most once per month. If you prefer, a simpler alternative is a separate `channel` column in the dedupe key — but keeping the key at three columns (as the reference dispatcher does) means encoding the channel into `threshold`.
->
-> For pure date-only `occurred_at` (`YYYY-MM-DD`), replace the window filter with `substr(occurred_at,1,7) = ?` bound to `ctx.monthPrefix`.
+The `staleMs` guard is what stops a newly-added task with a deadline from 2026-02
+firing E4, E5 and E6 all at once the moment it syncs. E7 has no such guard on
+purpose — an overdue task *should* nag.
 
-### A7 — Focus goal (push)
+---
 
-By 21:00 local, sum of tracked seconds today `< target`.
+## 6. E8 / E9 — routine
+
+E8 does **not** read Notion's `Active Now`. See `goals.md` for why that formula
+can never drive an edge trigger.
 
 ```ts
-// apps/worker/src/alerts/rules/a7_focusGoal.ts
-import type { Alert, Env } from "../types";
-import type { RunCtx } from "../context";
+// alerts/rules/routine.ts
+import type { Alert, RuleContext } from "../types";
+import { localDate, localMinutes, localWeekday, offsetMin, parseWindow } from "../time";
 
-const FOCUS_HOUR = 21; // local
+export interface RoutineRow {
+  notion_id: string;
+  activity: string;
+  time: string;          // "HH:MM - HH:MM"
+  days: string[];        // ["Sunday", ...]
+  archived: number;
+  done: number;
+}
 
-export async function ruleFocusGoal(env: Env, ctx: RunCtx): Promise<Alert[]> {
-  if (ctx.localHour < FOCUS_HOUR) return []; // only at/after 21:00 local
+const url = (id: string) => `https://www.notion.so/${id.replace(/-/g, "")}`;
+const pad = (m: number) =>
+  `${String(Math.floor(m / 60) % 24).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
 
-  const target = Number(env.FOCUS_TARGET_SECONDS ?? "14400"); // default 4h
+/**
+ * E8 — a routine block just started.
+ *
+ * Fires when local wall-clock is within ALERT_MAX_LATENESS_MIN *after* a block's
+ * start. The lateness window (rather than an exact minute match) means a skipped
+ * or delayed cron tick still delivers, while a Worker deployed mid-afternoon does
+ * not retroactively announce the morning's blocks.
+ */
+export function ruleRoutineStart(ctx: RuleContext, rows: RoutineRow[]): Alert[] {
+  if (ctx.env.ALERT_ROUTINE_START !== "true") return [];
+  const off = offsetMin(ctx.env);
+  const maxLate = Number(ctx.env.ALERT_MAX_LATENESS_MIN ?? 10);
+  const nowMin = localMinutes(ctx.now, off);
+  const out: Alert[] = [];
 
-  // Sum tracked seconds for timers that fall in today's local window.
-  const row = await env.DB.prepare(
-    `SELECT COALESCE(SUM(tracked_seconds), 0) AS total
-       FROM timer_snapshot
-      WHERE start_time >= ?
-        AND start_time <  ?`
-  ).bind(ctx.todayStartUtc, ctx.todayEndUtc).first<{ total: number }>();
+  for (const r of rows) {
+    if (r.archived) continue;
+    const win = parseWindow(r.time);
+    if (!win) continue;                       // malformed Time — skip, don't throw
+    const [startMin, endMin] = win;
 
-  const total = row?.total ?? 0;
-  if (total >= target) return [];
+    // Minutes since this block's start, wrapping across midnight.
+    let since = nowMin - startMin;
+    if (since < 0) since += 1440;
+    if (since > maxLate) continue;
 
-  const shortfall = target - total;
+    // The block's OWN start instant — for a 23:55 block observed at 00:02 the
+    // start belongs to yesterday. Both the weekday check and the dedupe key
+    // must use that date, not today's.
+    const startInstant = new Date(ctx.now.getTime() - since * 60_000);
+    const startDate = localDate(startInstant, off);
+    if (!r.days.includes(localWeekday(startInstant, off))) continue;
+
+    out.push({
+      rule: "E8",
+      entityId: r.notion_id,
+      threshold: `${startDate}T${pad(startMin)}`,   // once per block per day
+      subject: `🟢 ${r.activity} — ${pad(startMin)} to ${pad(endMin)}`,
+      html: card("Routine block started", [
+        ["Activity", r.activity || "—"],
+        ["Window", `${pad(startMin)} – ${pad(endMin)}`],
+        ["Day", localWeekday(startInstant, off)],
+      ], url(r.notion_id)),
+      notionUrl: url(r.notion_id),
+    });
+  }
+  return out;
+}
+
+/** E9 — one digest of the whole day's schedule. Off by default. */
+export function ruleRoutineDigest(ctx: RuleContext, rows: RoutineRow[]): Alert[] {
+  if (ctx.env.ALERT_ROUTINE_DIGEST !== "true") return [];
+  const off = offsetMin(ctx.env);
+  const at = (ctx.env.DIGEST_AT ?? "07:45").split(":");
+  const atMin = Number(at[0]) * 60 + Number(at[1]);
+  const nowMin = localMinutes(ctx.now, off);
+  const maxLate = Number(ctx.env.ALERT_MAX_LATENESS_MIN ?? 10);
+  if (nowMin < atMin || nowMin - atMin > maxLate) return [];
+
+  const today = localWeekday(ctx.now, off);
+  const blocks = rows
+    .filter((r) => !r.archived && r.days.includes(today) && parseWindow(r.time))
+    .sort((a, b) => parseWindow(a.time)![0] - parseWindow(b.time)![0]);
+
+  if (blocks.length === 0) return [];   // Fri/Sat under the current data
+
+  const list = blocks.map((b) => {
+    const [s, e] = parseWindow(b.time)!;
+    return `<tr><td style="padding:4px 12px 4px 0;color:#9aa3b2;white-space:nowrap">${pad(s)} – ${pad(e)}</td><td style="padding:4px 0">${esc(b.activity)}</td></tr>`;
+  }).join("");
+
   return [{
-    rule: "A7",
-    entityId: `focus-${ctx.localDate}`,
-    threshold: ctx.localDate,
-    channel: "push",
-    title: "Focus goal at risk",
-    body: `Only ${Math.round(total / 60)} min tracked today; ` +
-          `${Math.round(shortfall / 60)} min short of target.`,
-    html: "",
-    notionUrl: "",
+    rule: "E9",
+    entityId: "routine-digest",
+    threshold: localDate(ctx.now, off),
+    subject: `📅 ${today} — ${blocks.length} routine blocks`,
+    html: `<h2 style="font:600 16px system-ui;margin:0 0 12px">Today's routine — ${today}</h2><table style="font:14px system-ui;border-collapse:collapse">${list}</table>`,
   }];
 }
 ```
 
-> If timers don't carry a `tracked_seconds` column, compute it as `SUM((julianday(COALESCE(end_time, ?)) - julianday(start_time)) * 86400)` binding `ctx.nowIso` for still-running timers — but prefer a materialized `tracked_seconds` from Phase 2 for clarity and to avoid counting orphan timers.
-
 ---
 
-## The dispatcher
+## 7. Dispatcher
 
 ```ts
-// apps/worker/src/alerts/index.ts
-import type { Alert, Env } from "./types";
-import { makeCtx } from "./context";
-import { ruleOrphanTimer } from "./rules/a1_orphanTimer";
-import { ruleOverdue } from "./rules/a2_overdue";
-import { ruleDeadlineSoon } from "./rules/a3_deadlineSoon";
-import { ruleRoutineStart } from "./rules/a4_routineStart";
-import { ruleRoutineMissed } from "./rules/a5_routineMissed";
-import { ruleBudget } from "./rules/a6_budget";
-import { ruleFocusGoal } from "./rules/a7_focusGoal";
+// alerts/dispatch.ts
+import { localMinutes, offsetMin, parseHHMM } from "./time";
+import { sendEmail } from "./email";
+import type { Alert, RuleContext } from "./types";
 
-export async function runAlertRules(env: Env): Promise<void> {
-  const ctx = makeCtx(env);
+/** True when `now` falls inside ALERT_QUIET_HOURS. Empty var ⇒ always false. */
+function inQuietHours(ctx: RuleContext): boolean {
+  const raw = ctx.env.ALERT_QUIET_HOURS ?? "";
+  if (!raw.includes("-")) return false;
+  const [a, b] = raw.split("-");
+  const from = parseHHMM(a), to = parseHHMM(b);
+  if (from == null || to == null) return false;
+  const n = localMinutes(ctx.now, offsetMin(ctx.env));
+  return from <= to ? n >= from && n < to : n >= from || n < to;  // handles wrap
+}
+
+export async function runAlertRules(env: Env, now = new Date()): Promise<void> {
+  const ctx: RuleContext = { env, now };
+  const { timers, prev, tasks, routines } = await loadSnapshot(env);
 
   const candidates: Alert[] = [
-    ...await ruleOrphanTimer(env, ctx),
-    ...await ruleOverdue(env, ctx),
-    ...await ruleDeadlineSoon(env, ctx),
-    ...await ruleRoutineStart(env, ctx),
-    ...await ruleRoutineMissed(env, ctx),
-    ...await ruleBudget(env, ctx),
-    ...await ruleFocusGoal(env, ctx),
+    ...ruleTimerStarted(ctx, timers, prev),
+    ...ruleTimerTick(ctx, timers),
+    ...ruleTimerEnded(ctx, timers, prev),
+    ...ruleDeadlines(ctx, tasks),
+    ...ruleRoutineStart(ctx, routines),
+    ...ruleRoutineDigest(ctx, routines),
   ];
 
+  const quiet = inQuietHours(ctx);
+
   for (const a of candidates) {
+    // Dedupe on the composite key. This is what makes a rule that stays true
+    // for 60 ticks send exactly one email.
     const seen = await env.DB.prepare(
-      "SELECT 1 FROM alerts_sent WHERE rule = ? AND entity_id = ? AND threshold = ?"
+      `SELECT 1 FROM alerts_sent WHERE rule=? AND entity_id=? AND threshold=?`,
     ).bind(a.rule, a.entityId, a.threshold).first();
     if (seen) continue;
 
+    if (quiet) {
+      // Record it as suppressed so the dedupe key is consumed and the audit
+      // trail shows *why* nothing arrived — silent drops are undebuggable.
+      await recordSent(env, a, "suppressed", now);
+      continue;
+    }
+
+    let status = "sent";
     try {
-      if (a.channel === "push") {
-        await pushFcm(env, a.title, a.body, { url: a.notionUrl }, a.rule, a.entityId);
-      } else if (a.channel === "email") {
-        await sendEmail(env, a.title, a.html);
-        await logEmail(env, a); // email path logs explicitly (pushFcm logs itself)
-      }
-      await recordSent(env, a);
-    } catch (err) {
-      // Do NOT record dedupe on failure, so the next tick retries.
+      await sendEmail(env, a.subject, a.html);
+    } catch (e) {
+      status = `error: ${(e as Error).message}`.slice(0, 200);
+    }
+    await recordSent(env, a, status, now);
+
+    // E2 only: persist the bucket so a redeploy can't replay it.
+    if (a.rule === "E2" && status === "sent") {
+      const mins = Number(a.threshold.replace("m", ""));
+      const step = Number(env.ALERT_TIMER_TICK_MINUTES ?? 30);
       await env.DB.prepare(
-        `INSERT INTO alert_log (rule, entity_id, channel, message, status, sent_at)
-         VALUES (?, ?, ?, ?, 'error', datetime('now'))`
-      ).bind(a.rule, a.entityId, a.channel, String(err)).run();
+        `UPDATE timer_snapshot SET notified_bucket=? WHERE notion_id=?`,
+      ).bind(Math.floor(mins / step), a.entityId).run();
     }
   }
 }
+
+async function recordSent(env: Env, a: Alert, status: string, now: Date) {
+  const ts = now.toISOString();
+  await env.DB.batch([
+    env.DB.prepare(
+      `INSERT OR IGNORE INTO alerts_sent (rule, entity_id, threshold, sent_at)
+       VALUES (?, ?, ?, ?)`,
+    ).bind(a.rule, a.entityId, a.threshold, ts),
+    env.DB.prepare(
+      `INSERT INTO alert_log (rule, entity_id, channel, message, status, sent_at)
+       VALUES (?, ?, 'email', ?, ?, ?)`,
+    ).bind(a.rule, a.entityId, a.subject, status, ts),
+  ]);
+}
 ```
 
-The scheduled handler wires it in after the upsert:
-
-```ts
-// apps/worker/src/index.ts (excerpt)
-export default {
-  async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
-    await syncNotionToD1(env);   // Phase 2/3: pull + upsert (captures prev_active_now)
-    await runAlertRules(env);    // Phase 4
-  },
-};
-```
+> **Failure ordering.** A send that throws still writes `alerts_sent`, so a
+> transient Resend outage costs you that one notification rather than looping
+> forever. `alert_log.status` carries the error. Phase 7 revisits this with a
+> bounded retry; for a personal tool, dropping one email beats a retry storm.
 
 ---
 
-## Channels and logging
-
-### `recordSent` — writes both `alerts_sent` and `alert_log`
-
-`alerts_sent` has composite PK `(rule, entity_id, threshold)`. `alert_log` is an append-only audit table.
+## 8. Email via Resend
 
 ```ts
-// apps/worker/src/alerts/record.ts
-import type { Alert, Env } from "./types";
-
-export async function recordSent(env: Env, a: Alert): Promise<void> {
-  // Dedupe row (idempotent via composite PK). Use INSERT OR IGNORE for safety.
-  await env.DB.prepare(
-    `INSERT OR IGNORE INTO alerts_sent (rule, entity_id, threshold, sent_at)
-     VALUES (?, ?, ?, datetime('now'))`
-  ).bind(a.rule, a.entityId, a.threshold).run();
-}
-```
-
-The push channel logs itself (so the stub is self-contained); the email path logs via `logEmail`:
-
-```ts
-export async function logEmail(env: Env, a: Alert): Promise<void> {
-  await env.DB.prepare(
-    `INSERT INTO alert_log (rule, entity_id, channel, message, status, sent_at)
-     VALUES (?, ?, 'email', ?, 'sent', datetime('now'))`
-  ).bind(a.rule, a.entityId, a.title).run();
-}
-```
-
-Reference DDL (from Phase 2, repeated for clarity):
-
-```sql
-CREATE TABLE IF NOT EXISTS alerts_sent (
-  rule       TEXT NOT NULL,
-  entity_id  TEXT NOT NULL,
-  threshold  TEXT NOT NULL,
-  sent_at    TEXT NOT NULL,       -- ISO 8601 UTC (datetime('now'))
-  PRIMARY KEY (rule, entity_id, threshold)
-);
-
-CREATE TABLE IF NOT EXISTS alert_log (
-  id         INTEGER PRIMARY KEY AUTOINCREMENT,
-  rule       TEXT NOT NULL,
-  entity_id  TEXT NOT NULL,
-  channel    TEXT NOT NULL,       -- 'push' | 'email'
-  message    TEXT,
-  status     TEXT NOT NULL,       -- 'sent' | 'error'
-  sent_at    TEXT NOT NULL
-);
-```
-
-### `sendEmail` — Resend HTTP API (no SMTP)
-
-```ts
-// apps/worker/src/alerts/email.ts
-import type { Env } from "./types";
-
+// alerts/email.ts
 export async function sendEmail(env: Env, subject: string, html: string): Promise<void> {
   const res = await fetch("https://api.resend.com/emails", {
     method: "POST",
@@ -597,180 +618,144 @@ export async function sendEmail(env: Env, subject: string, html: string): Promis
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      from: env.ALERT_FROM,
-      to: env.ALERT_TO,
+      from: env.ALERT_FROM,     // "Notion Ops <onboarding@resend.dev>" works untested-domain
+      to: [env.ALERT_TO],
       subject,
-      html,
+      html: shell(html),
     }),
   });
-  if (!res.ok) {
-    throw new Error(`Resend failed: ${res.status} ${await res.text()}`);
-  }
+  if (!res.ok) throw new Error(`Resend ${res.status}: ${(await res.text()).slice(0, 200)}`);
+}
+
+const esc = (s: string) =>
+  String(s ?? "").replace(/[&<>"]/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]!));
+
+/** Shared card body used by the rule templates. */
+export function card(title: string, fields: [string, string][], link?: string): string {
+  const rows = fields.map(([k, v]) =>
+    `<tr><td style="padding:4px 16px 4px 0;color:#9aa3b2;white-space:nowrap">${esc(k)}</td>` +
+    `<td style="padding:4px 0;color:#e6e8ee">${esc(v)}</td></tr>`).join("");
+  const cta = link
+    ? `<p style="margin:16px 0 0"><a href="${esc(link)}" style="color:#6ea8fe">Open in Notion →</a></p>`
+    : "";
+  return `<h2 style="font:600 16px system-ui;margin:0 0 12px;color:#e6e8ee">${esc(title)}</h2>`
+       + `<table style="font:14px system-ui;border-collapse:collapse">${rows}</table>${cta}`;
+}
+
+function shell(inner: string): string {
+  return `<div style="background:#0d0f14;padding:24px;font-family:system-ui,sans-serif">`
+       + `<div style="max-width:32rem;margin:0 auto;background:#161a22;border:1px solid #232a36;`
+       + `border-radius:12px;padding:20px">${inner}</div></div>`;
 }
 ```
 
-### `pushFcm` — STUB for this phase
+**Resend on the free tier:** `onboarding@resend.dev` is a usable `from` without
+verifying a domain, but it can only deliver to **the address that owns the Resend
+account**. Since `ALERT_TO` is your own inbox, that is sufficient. Verify a domain
+later only if you want a custom `From`.
 
-Writes to `alert_log` so push rules are verifiable without a phone. Phase 6 replaces the body with a real FCM HTTP v1 call.
+Set the secrets:
+
+```powershell
+echo "re_xxxxxxxxxxxx"                        | npx wrangler secret put RESEND_API_KEY
+echo "Notion Ops <onboarding@resend.dev>"     | npx wrangler secret put ALERT_FROM
+echo "sami999khan999@gmail.com"               | npx wrangler secret put ALERT_TO
+```
+
+---
+
+## 9. Phase 3 coordination
+
+`scheduled()` must capture the previous timer state **before** upserting:
 
 ```ts
-// apps/worker/src/alerts/push.ts
-import type { Env } from "./types";
-
-export async function pushFcm(
-  env: Env,
-  title: string,
-  body: string,
-  data: Record<string, string>,
-  rule: string,
-  entityId: string
-): Promise<void> {
-  // STUB: no network call. Log as if delivered.
+async function runSync(env: Env) {
+  // 1. Snapshot the pre-upsert timer state so E1/E3 can see transitions.
   await env.DB.prepare(
-    `INSERT INTO alert_log (rule, entity_id, channel, message, status, sent_at)
-     VALUES (?, ?, 'push', ?, 'sent', datetime('now'))`
-  ).bind(rule, entityId, `${title} — ${body}`).run();
+    `INSERT OR REPLACE INTO timer_prev (notion_id, status, end_time, seen_at)
+     SELECT notion_id, status, end_time, datetime('now') FROM timer_snapshot`,
+  ).run();
 
-  // Phase 6 will instead POST to
-  //   https://fcm.googleapis.com/v1/projects/<project>/messages:send
-  // with an OAuth bearer token and { message: { token, notification, data } }.
+  // 2. Pull + upsert (tasks & timers incremental; routine full — see below).
+  await pullAndUpsertTimers(env);
+  await pullAndUpsertTasks(env);
+  await pullAndUpsertRoutine(env);
+
+  // 3. Rules run against the fresh snapshot with timer_prev still holding the old state.
+  await runAlertRules(env);
 }
 ```
 
----
+**Routine is pulled in full every tick, not incrementally.** 20 active rows is one
+query, and an incremental cursor would be actively wrong here: routine rows are
+edited rarely, so a `last_edited_time` filter would return nothing on almost every
+tick while the blocks still need evaluating. E8 needs the *rows*, not the *edits*.
 
-## A4 edge-trigger coordination with Phase 3
-
-A4 must fire on the `active_now` transition `false → true`, not on every tick where `active_now = 1`. To detect the *edge*, the rule needs both the **previous** and the **current** value of `active_now`.
-
-**The problem:** Phase 3's upsert overwrites `routine_snapshot` with fresh Notion data. If A4 runs *after* the upsert (which it does — rules read the fresh snapshot), the old `active_now` is already gone.
-
-**The coordination:** Phase 3 captures the previous `active_now` **before** overwriting it and stores it in a companion column `prev_active_now`. Concretely, the upsert reads the existing row's `active_now` into `prev_active_now`, then writes the new `active_now`:
-
-```sql
--- Phase 3 upsert (excerpt) — carry the old active_now into prev_active_now.
-INSERT INTO routine_snapshot (id, name, active_now, prev_active_now, today, done, notion_url)
-VALUES (?, ?, ?, 0, ?, ?, ?)
-ON CONFLICT(id) DO UPDATE SET
-  prev_active_now = routine_snapshot.active_now,  -- OLD value, captured before overwrite
-  active_now      = excluded.active_now,          -- NEW value from Notion
-  name            = excluded.name,
-  today           = excluded.today,
-  done            = excluded.done,
-  notion_url      = excluded.notion_url;
-```
-
-Key point: in SQLite's `ON CONFLICT DO UPDATE`, `routine_snapshot.active_now` on the right-hand side still refers to the **existing** (pre-update) row value, while `excluded.active_now` is the incoming value. So `prev_active_now = routine_snapshot.active_now` reliably captures the old state in the same statement. A4 then reads `prev_active_now = 0 AND active_now = 1`.
-
-**Ordering contract:** `syncNotionToD1` (upsert, including this `prev_active_now` capture) must complete **before** `runAlertRules`. The dedupe key (`A4`, routine id, local date) is the belt-and-suspenders guarantee that even a duplicated edge observation sends at most once per day.
+Tasks (359) and Time Tracker (162) keep the incremental cursor, overlapped by
+~2 minutes per Phase 7 — `last_edited_time` has **minute granularity**, so a
+zero-overlap cursor can drop an edit that lands in the same minute as the cursor.
 
 ---
 
-## Threshold semantics
+## 10. Verification
 
-`threshold` is the third column of the dedupe composite key. It lets a single rule fire at multiple tiers / re-arm per period. What it holds per rule:
+| Exit criterion | Test |
+|---|---|
+| E8 fires at the right local minute | Freeze `now` to `2026-08-17T03:00:00Z` (= Monday 09:00 Dhaka). Assert exactly one E8, for the `09:00 - 13:00 Work` block. At `03:11:00Z` (09:11, past the 10-min window) assert zero. |
+| **Timezone regression guard** | Run the same test with `ALERT_TZ_OFFSET_MINUTES=0`. It **must fail** — if it passes, the offset is not being applied and every routine email is six hours off. |
+| E8 midnight wrap | Freeze to Tuesday `00:02` local. The `23:55 - 00:00 Exercise` block fires with threshold dated **Monday**, not Tuesday. |
+| Fri/Sat silence | Freeze to any Friday. Assert zero E8 candidates (all Fri rows archived). |
+| E2 buckets | Seed a running timer started 95 min ago with `notified_bucket=0`. Assert one candidate, `90m`. Set `notified_bucket=3`, assert none. |
+| E1/E3 edges | Seed `timer_prev.status='Stoped'`, snapshot `Running` → one E1. Re-run with prev now `Running` → zero. Flip snapshot to `Stoped` + `end_time` → one E3. |
+| E5 skips date-only | Seed `deadline='2026-02-22'`. Assert E4/E6/E7 possible, **never** E5. |
+| Stale-deadline guard | Seed a deadline 30 days past. Assert E4/E5/E6 all silent, E7 fires. |
+| Dedupe | Run any tick twice unchanged. Second run adds zero `alert_log` rows. |
+| Quiet hours | Set `ALERT_QUIET_HOURS=00:00-07:45`, freeze to 02:00. Candidates get `alert_log.status='suppressed'` and no Resend call. |
 
-| Rule | `entityId` | `threshold` | Effect |
-|------|-----------|-------------|--------|
-| A1 Orphan timer | timer id | `"1"` | One alert per orphaned timer until stopped |
-| A2 Task overdue | task id | `"1"` | One alert per overdue task (Phase 7 adds TTL to re-alert daily) |
-| A3 Deadline soon | task id | `"1"` | One "due soon" nudge per task |
-| A4 Routine start | routine id | local date `YYYY-MM-DD` | One per block start per day (re-arms daily) |
-| A5 Routine missed | `digest-<date>` | local date `YYYY-MM-DD` | One digest email per day |
-| A6 Budget | `expense-<YYYY-MM>` | `"80"` / `"100"` (+ `-email` for the email copy) | Each tier & channel fires once per month |
-| A7 Focus goal | `focus-<date>` | local date `YYYY-MM-DD` | One evening nudge per day |
-
-The general pattern: encode a **period** (date or month) into `entityId` or `threshold` when the rule should re-arm each period; use a constant `"1"` when it should fire once per entity for the entity's lifetime in the condition.
-
----
-
-## Testing
-
-Everything is verifiable against local D1 with `wrangler` — no phone, no live Notion, no real email needed (Resend can point at a test key or be asserted at the `alert_log` level if you also route email through `logEmail`).
-
-### Setup
-
-```bash
-# Apply schema to local D1
-wrangler d1 execute ops --local --file=./schema.sql
-
-# Seed snapshot rows (see per-rule seeds below)
-wrangler d1 execute ops --local --file=./test/seed_a1.sql
-
-# Trigger the scheduled handler locally
-wrangler dev --test-scheduled
-# then hit the scheduled trigger endpoint, e.g.:
-curl "http://localhost:8787/__scheduled?cron=*+*+*+*+*"
-
-# Assert what fired
-wrangler d1 execute ops --local \
-  --command "SELECT rule, entity_id, channel, status FROM alert_log ORDER BY id;"
-wrangler d1 execute ops --local \
-  --command "SELECT * FROM alerts_sent;"
-```
-
-### Forcing each rule
-
-Seed rows so each condition is true. Examples (adjust to your schema; `now` here means "relative to the test clock"):
-
-```sql
--- A1: running timer started >3h ago, no end_time
-INSERT INTO timer_snapshot (id, status, start_time, end_time, notion_url)
-VALUES ('t-orphan', 'Running', '2026-07-21T05:00:00Z', '', 'https://notion.so/t-orphan');
-
--- A2: task deadline in the past, not completed/archived
-INSERT INTO task_snapshot (id, name, deadline, completed, archived, notion_url)
-VALUES ('k-late', 'Ship report', '2026-07-19T00:00:00Z', 0, 0, 'https://notion.so/k-late');
-
--- A3: task due within next 24h
-INSERT INTO task_snapshot (id, name, deadline, completed, archived, notion_url)
-VALUES ('k-soon', 'Review PR', '2026-07-21T20:00:00Z', 0, 0, 'https://notion.so/k-soon');
-
--- A4: rising edge — prev 0, now 1
-INSERT INTO routine_snapshot (id, name, active_now, prev_active_now, today, done, notion_url)
-VALUES ('r-focus', 'Deep work', 1, 0, 1, 0, 'https://notion.so/r-focus');
-
--- A5: routine planned today but not done (test at localHour >= 23)
-INSERT INTO routine_snapshot (id, name, active_now, prev_active_now, today, done, notion_url)
-VALUES ('r-gym', 'Gym', 0, 0, 1, 0, 'https://notion.so/r-gym');
-
--- A6: expenses at 100% of goal
-INSERT INTO goals (key, amount) VALUES ('Expense Goal', 1000);
-INSERT INTO txn_snapshot (id, type, amount, occurred_at)
-VALUES ('x1', 'Expense', 1000, '2026-07-10T00:00:00Z');
-
--- A7: little/no tracked time today (test at localHour >= 21)
--- (simply have no timer rows in today's window, or a small tracked_seconds)
-```
-
-### Assertions
-
-1. **Fires once per condition.** After one run, `alert_log` has exactly one row per triggered `(rule, entity_id, threshold)`.
-2. **No double-send.** Run the scheduled handler a second time with the snapshot unchanged; assert `SELECT COUNT(*) FROM alert_log` is unchanged and `alerts_sent` has no duplicate rows.
-3. **A4 edge.** After the first run (prev 0 → now 1) A4 fires. Simulate a subsequent tick by setting `prev_active_now = 1` (still active) and re-run; assert A4 does **not** fire again.
-4. **A6 two tiers.** Seed expenses at 85% → only the `"80"` tier fires (push + email). Bump to 100% and re-run → the `"100"` tier fires; the `"80"` tier does not fire again.
-5. **Time gates.** A5/A7 only fire when the (mockable) local hour is at/after their thresholds. Inject a fixed `now` into `makeCtx` in tests to control `localHour`.
-
-For deterministic tests, make `makeCtx(env, now)` accept an injected `now` and pass a fixed `Date` from the test so day boundaries and hour gates are stable.
+Because every rule takes `now` as a parameter, all of this runs as plain unit
+tests against a seeded local D1 — no waiting on real clocks.
 
 ---
 
-## Pitfalls
+## 11. Pitfalls
 
-- **Dedupe key design.** The composite `(rule, entity_id, threshold)` must uniquely capture "this specific alert instance". Get the discriminator wrong and you either double-send (key too coarse) or never re-arm (key too fine). Encode the period into the key for rules that should re-fire per day/month (A4/A5/A7 use the date; A6 uses the month in `entityId`).
+1. **Never build an edge trigger on a Notion formula.** `Active Now`,
+   `Total Time In Seconds Today`, `Time Remains`, `Schedule Status` all change
+   with the clock without touching `last_edited_time`. They are display values.
+   Compute triggers locally.
 
-- **A4 edge-trigger ordering.** A4 depends entirely on Phase 3 populating `prev_active_now` **before** the upsert overwrites `active_now`, and on `runAlertRules` running **after** the upsert. If the upsert doesn't carry the old value, A4 either never fires (if it reads only the new value) or fires every tick (if `prev` is always 0). Verify the `ON CONFLICT DO UPDATE SET prev_active_now = routine_snapshot.active_now` behavior.
+2. **`Total Time In Seconds` is 0 while a timer runs.** The formula guards on
+   `End Time`. Compute live elapsed as `now − Start Time` yourself (E2 does).
 
-- **A6 two thresholds (and two channels).** Both tiers must be able to fire independently, and A6 dispatches on push *and* email. Because the reference dedupe key has only three columns, the channel is folded into `threshold` (`"80"`, `"80-email"`, `"100"`, `"100-email"`). Don't collapse these or one channel will suppress the other.
+3. **Filter Time Tracker `Status` by option name, never by group.** Its groups
+   are miswired — `Running` sits under **Complete**. `status: {equals: "Running"}`
+   is correct; anything group-based is not.
 
-- **Idempotent sends (log-before/around network call).** This phase records dedupe **after** a successful dispatch and skips recording on error (so failures retry next tick). This means a crash *between* the network call succeeding and `recordSent` writing could theoretically double-send. Full idempotency treatment (writing an "attempting" log row before the call, reconciling on the next tick) is deferred to **Phase 7**. For Phase 4, the stub push has no network call, and email double-sends on rare crashes are acceptable and logged.
+4. **Tasks `Status` is not task state.** All 359 rows are `Stoped`. Never gate a
+   rule on it.
 
-- **Read-only formula fields.** Fields like `active_now`, `today`, and computed rollups often originate as Notion **formula/rollup** properties. They are read-only projections snapshotted into D1 — never write back to them, and remember they can change value between syncs without any explicit user edit. Treat them as observed state, which is exactly why A4 needs the prev/now comparison.
+5. **Deadline precision is mixed.** Branch on `length === 10`. A date-only value
+   has no time, so "1 hour before" is meaningless — E5 skips it.
 
-- **No SMTP on Workers.** Cloudflare Workers cannot open SMTP sockets. Email must go over HTTPS via Resend. Don't reach for `nodemailer` or any SMTP library — it won't run.
+6. **The dedupe threshold must contain a date for anything recurring.** E8's key
+   is `YYYY-MM-DDTHH:MM`. Drop the date and each block fires once *ever*, then
+   goes permanently silent the next day. This is the single easiest way to
+   silently break the whole routine feature.
 
-- **Time zones.** Store UTC everywhere; only *interpret* days/hours in `env.ALERT_TZ`. The common bug is using SQLite `date('now')` (UTC) for "today", which misattributes late-evening local activity. Compute boundaries in JS from the configured TZ and bind concrete UTC instants (see `time.ts`).
+7. **Use the block's own start date in the dedupe key**, not today's — otherwise
+   the `23:55` block observed at `00:02` gets tomorrow's key and can double-fire.
 
-- **Goal missing / division by zero.** A6 must guard `goal <= 0` (no Expense Goal configured) and return `[]` rather than dividing by zero or firing spuriously.
+8. **`ALTER TABLE ADD COLUMN` is not idempotent** in SQLite. Keep it in a
+   numbered migration, not in the re-appliable `schema.sql`.
 
-- **Empty vs NULL.** Notion exports often yield empty strings rather than NULL for cleared fields (e.g. `end_time = ''`). Check both `IS NULL OR = ''` where it matters (A1).
+9. **Local and remote D1 are separate stores.** Seeded test rows and
+   `alerts_sent` history exist independently in each.
+
+10. **Escape interpolated Notion text in HTML.** Activity and task titles are
+    user-controlled; `card()` escapes via `esc()`. Do not hand-build template
+    strings that skip it.
+
+11. **Notion `last_edited_time` is minute-granular.** Detection of a timer start
+    lands 1–2 minutes after the fact. That is a hard floor on E1 latency — cron
+    frequency cannot improve it.

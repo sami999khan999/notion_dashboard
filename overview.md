@@ -1,6 +1,26 @@
 # Notion Ops Dashboard — Implementation Plan
 
-A single Cloudflare Worker (TanStack Start app) that polls your Notion workspace every minute, detects status conditions across Daily Routine / Tasks / Time Tracker / Transactions, and pushes alerts to a **Flutter app on your phone** (via FCM), with optional email. State is persisted in D1; a live dashboard reads from it.
+> ## ⚠️ Revised 2026-08-16 — parts of this file are superseded
+>
+> The plan changed. This document remains useful for the overall architecture,
+> Phases 0–3, 5 and 7, and the wrangler config — but the following are **out of
+> date**, and `context/` is the source of truth:
+>
+> | Superseded here | Current source |
+> |---|---|
+> | Alert rules A1–A7 (§2) | **`context/phase-4-alert-engine/`** — rules E1–E9, email only |
+> | Push / FCM / Flutter as primary channel | **Email only.** Phase 6 deferred |
+> | Property tables (§1) | **`context/notion-schema.md`** — API-verified, corrects real errors |
+> | `Notion-Version: 2022-06-28` (§4, §5) | **`2025-09-03`** + data-source endpoint |
+> | "Log in with Notion" as the gate (§5) | **Password gate**, OAuth secondary — `context/phase-8-auth/` |
+>
+> **Read [`context/notion-schema.md`](./context/notion-schema.md) before writing
+> any Notion code.** Three of the errors it corrects are load-bearing: routine
+> `Active Now` is a *string* not a boolean, `Total Time In Seconds` is `0` while a
+> timer runs, and Notion formulas don't bump `last_edited_time` — which means the
+> incremental-sync design in §3 below **cannot** drive routine alerts.
+
+A single Cloudflare Worker (TanStack Start app) that polls your Notion workspace every minute, detects status conditions across Daily Routine / Tasks / Time Tracker / Transactions, and **emails you** about them. State is persisted in D1; a live dashboard reads from it, behind a password.
 
 ---
 
@@ -39,6 +59,14 @@ The public Notion API is queried by database ID (32-char) on the classic endpoin
 | Transactions | `cfe3d0b2968f499cbd0774e8f6c4e09f` | `4aa375e0-4e19-4b48-a639-850786543875` |
 | Goals | `be4a4954aa374e57928173258a68f15a` | `93a3a8d9-ed49-4c95-b0da-39b4c93dadfd` |
 
+> ⚠️ **The property list below contains errors.** Use
+> [`context/notion-schema.md`](./context/notion-schema.md) instead — it was
+> captured live from the API. Known-wrong entries here: routine `Active Now` is a
+> formula → **string**, not boolean; Tasks `Active Now` is a **rollup**, not a
+> formula; routine `Today` is a **string** (the boolean is `Today Check`); Tasks
+> `Status` is **unused** (all 359 rows are `Stoped`); and Daily Routine **cannot
+> be queried on `2022-06-28`** at all — it has five data sources.
+
 **Property names to use verbatim** (Notion is exact-match; several of yours have typos worth preserving):
 
 - Tasks: `Tasks` (title), `Category` (select), `Priority` (multi), `Status` (status → `Running`/`Stoped`), `Deadline` (date), `Date` (date), `Completed` (checkbox), `Archive` (checkbox), `Task Progress` (formula), `Total Time In Seconds Today` (rollup), `Task Time Tracker` / `Daily Routine Relation` (relations)
@@ -53,7 +81,24 @@ The public Notion API is queried by database ID (32-char) on the classic endpoin
 
 ## 2. What the system does (feature spec grounded in your data)
 
-### Alert rules
+### Alert rules — ⚠️ SUPERSEDED
+
+> The A1–A7 table below is **no longer the plan**. It is kept only to explain what
+> changed. The current rule set is **E1–E9** in
+> [`context/phase-4-alert-engine/`](./context/phase-4-alert-engine/).
+>
+> | Old | Fate |
+> |---|---|
+> | A1 orphan timer | replaced by **E1/E2/E3** — full timer lifecycle: started, every 30 min, ended |
+> | A2 overdue / A3 deadline soon | expanded to **E4–E7** — 24h, 1h, at-deadline, missed |
+> | A4 routine starting | **E8**, but rebuilt: `Active Now` is a *string* and formulas never bump `last_edited_time`, so the edge-trigger below **would never have fired**. E8 computes windows locally from `Time` + `Days` + `Asia/Dhaka` |
+> | A5 routine missed | dropped; **E9** daily digest available, off by default |
+> | A6 budget / A7 focus goal | dropped — Transactions/Goals still sync and display, they just don't alert |
+> | Push primary, email secondary | **email only**; Phase 6 deferred |
+
+<details>
+<summary>Original A1–A7 table (historical)</summary>
+
 | # | Rule | Source DB | Condition | Channel |
 |---|---|---|---|---|
 | A1 | **Orphan timer** | Time Tracker | `Status = Running` AND `Start Time` older than 3h AND `End Time` empty | Push (high) |
@@ -64,9 +109,11 @@ The public Notion API is queried by database ID (32-char) on the classic endpoin
 | A6 | **Budget threshold** | Transactions + Goals | current-month Σ`Amount` where `Type=Expense` ≥ 80% / 100% of `Expense Goal` | Push + Email |
 | A7 | **Focus goal** | Time Tracker | by 21:00, Σ tracked seconds today < daily target | Push |
 
-Each rule is a pure function `(snapshot) → Alert[]`. Dedupe is enforced by a `(rule, entity_id, threshold)` unique key so a rule that stays true for 60 minutes fires once, not 60 times.
+</details>
 
-Primary channel is **push to your Flutter app** (built in Phase 2). Email is the secondary channel for digests — sent via an HTTP email API (Resend/Postmark/etc.), **not** SMTP/Nodemailer, which can't run on Workers.
+What carries over unchanged: each rule is a pure function `(snapshot, now) → Alert[]`, and dedupe is enforced by a `(rule, entity_id, threshold)` unique key so a rule that stays true for 60 minutes fires once, not 60 times. Recurring rules now put a **date** in the threshold so they re-arm daily.
+
+The single channel is **email**, via **SMTP** (default) or the **Resend HTTP API**, selected with `EMAIL_PROVIDER`. See the pitfalls section for the corrected SMTP story.
 
 ### Dashboard widgets
 - **Now strip** — current routine activity (`Active Now`), running task + timer, live elapsed seconds.
@@ -415,31 +462,42 @@ Once the sender works, replace the stub `pushFcm` used by the Phase 4 alert engi
 
 ## 6. Effort estimate
 
+> ⚠️ Revised — Phase 6 is deferred and Phase 8 (auth) was added. Current table:
+
 | Phase | Scope | Est. |
 |---|---|---|
 | 0 | Scaffold + bindings | ½ day |
 | 1 | Notion client + normalizers | 1 day |
 | 2 | D1 schema | ½ day |
 | 3 | Sync engine | 1 day |
-| 4 | Alert engine + channels | 1–1.5 days |
+| 4 | Alert engine + email (E1–E9) | 1–1.5 days |
 | 5 | Dashboard UI + charts | 1.5 days |
-| 6 | Flutter app + FCM pipeline | 1.5–2 days |
+| 8 | Auth — password + Notion OAuth | ½–1 day |
 | 7 | Hardening | ½–1 day |
-| | **Total** | **~7.5–9 days** |
+| ~~6~~ | ~~Flutter app + FCM pipeline~~ — **deferred** | — |
+| | **Total** | **~6.5–8 days** |
 
-Build order: 0 → 1 → 2 → 3 → (4 ∥ 5) → 6 → 7. The backend, alerts, and dashboard are fully working before the app exists — Phase 4 alerts run against a stub `pushFcm` that logs to `alert_log`, so you can verify every rule fires correctly without a phone. The Flutter app (Phase 6) is built last and just swaps the stub for the real FCM sender. Alerts (4) and dashboard (5) both read the D1 mirror, so they parallelize once Phase 3 lands.
+Build order: 0 → 1 → 2 → 3 → (4 ∥ 5) → 8 → 7. Alerts (4) and dashboard (5) both read the D1 mirror, so they parallelize once Phase 3 lands. Auth (8) moved ahead of hardening so the dashboard isn't sitting on a public URL unguarded. Phase 6 is deferred — email covers the notification requirement, and the `Alert` shape already carries everything a push would need if it's revived.
 
 ---
 
 ## 7. Known pitfalls specific to this build
 
-- **No SMTP / Nodemailer on Workers** — outbound SMTP sockets aren't supported; email must go through an HTTP API (Resend/Postmark/etc.).
+- **SMTP works on Workers; Nodemailer does not.** ⚠️ Earlier drafts of this file said outbound SMTP was impossible — that was wrong. Cloudflare blocks port **25** only; **587 (STARTTLS)** and **465 (TLS)** connect fine via `cloudflare:sockets`, and `startTls()` really upgrades (verified against smtp.gmail.com). What fails is Nodemailer, which needs `node:net`/`node:tls` internals nodejs_compat lacks — so speak the protocol directly.
 - **FCM v1 needs OAuth2** — the legacy server-key API is gone; mint a JWT from the service account and sign RS256 with Web Crypto, cache the 1-hour token.
 - **Service-account key formatting** — the `private_key` in the secret must keep its `\n` newlines or the JWT signing fails.
 - **Stale device tokens** — FCM returns 404/UNREGISTERED for uninstalled apps; deactivate them in D1 (handled in `pushFcm`).
 - **iOS push isn't free** — needs Apple Developer ($99/yr) + APNs `.p8`; Android is free.
 - **Foreground messages don't auto-show** — render them with `flutter_local_notifications`.
 - **Formula/rollup/status fields are read-only** — `Active Now`, `Task Progress`, `Total Time…`, `Status`; read, never write.
-- **Property typos are real** — `Day Cateogry`, `Summery`, and the `Stoped` status value must match exactly.
+- **Formulas never bump `last_edited_time`** — `Active Now` flipping to Active produces no edit event, so incremental sync cannot see it. Never build an edge trigger on a formula; compute it locally. *(This invalidates the A4 design above.)*
+- **`Total Time In Seconds` is `0` while a timer runs** — the formula guards on `End Time`. Compute elapsed as `now − Start Time`.
+- **Daily Routine has five data sources** — it 400s on `Notion-Version: 2022-06-28`. Use `2025-09-03` + `POST /v1/data_sources/{id}/query` everywhere.
+- **Time Tracker's `Status` groups are miswired** — `Running` is grouped under "Complete". Filter by option name, never by group.
+- **Tasks `Status` is dead data** — all 359 rows are `Stoped`. Timer state lives in Time Tracker.
+- **Deadline precision is mixed** — some values are date-only (`2026-02-22`), some are datetimes. "1 hour before" is undefined for the former.
+- **Everything is `Asia/Dhaka` (+06:00, no DST)** — routine `Time` strings are bare wall-clock and the Worker runs in UTC. Get this wrong and every routine email is six hours off.
+- **`Start`/`Pause` on Tasks are `button` properties** — the API can neither read nor press them. The dashboard stays read-only.
+- **Property typos are real** — `Day Cateogry`, `Summery`, `Project Plans ` (trailing space), and the `Stoped` status value must match exactly.
 - **KV eventual consistency** — keep authoritative state in D1; use KV only for fire-and-forget dedupe/token-cache.
 - **Cron overlap** — guard a slow run with a D1 lock row if a run risks exceeding 60s.

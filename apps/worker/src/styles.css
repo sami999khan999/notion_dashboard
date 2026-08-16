@@ -1,0 +1,202 @@
+@import 'tailwindcss';
+
+/**
+ * Near-black analytics surface: large radii, pill controls, vivid accents on a
+ * very dark ground. Deliberately not Notion's flat 4px language — this follows
+ * the reference direction instead.
+ *
+ * Dark only. A light mode would need its own validated chart ramp (the hues
+ * that separate on #0A0A0A are not the ones that separate on white), and
+ * shipping an unvalidated flip is worse than not shipping one.
+ */
+@theme {
+  --color-page: #0a0a0a;
+  --color-card: #101010;
+  --color-raised: #171717;
+  --color-track: #1e1e1e;
+
+  --color-ink: #ffffff;
+  --color-ink-2: #9a9a9a;
+  --color-ink-3: #6b6b6b;
+
+  --color-line: rgba(255, 255, 255, 0.07);
+  --color-line-strong: rgba(255, 255, 255, 0.14);
+  --color-hover: rgba(255, 255, 255, 0.06);
+
+  --color-accent: #3b82f6;
+  --color-good: #22c55e;
+  --color-warn: #f5a524;
+  --color-bad: #f04438;
+
+  /* Categorical — validated on ALL pairs against a near-black surface.
+     See dashboard/activity.ts for provenance. */
+  --color-c1: #3b82f6;
+  --color-c2: #e8690f;
+  --color-c3: #16a34a;
+  --color-c4: #c43ba0;
+  --color-c5: #6b6b6b;
+
+  --radius-card: 18px;
+
+  --font-sans:
+    ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Inter,
+    Helvetica, 'Apple Color Emoji', Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+html {
+  background: var(--color-page);
+  color: var(--color-ink);
+  color-scheme: dark;
+  -webkit-font-smoothing: antialiased;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.card {
+  background: var(--color-card);
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius-card);
+}
+
+.card-inner {
+  background: var(--color-raised);
+  border: 1px solid var(--color-line);
+  border-radius: 12px;
+}
+
+.eyebrow {
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.04em;
+  color: var(--color-ink-3);
+}
+
+/* Icon rail ---------------------------------------------------------------- */
+.rail-btn {
+  display: grid;
+  place-items: center;
+  width: 40px;
+  height: 40px;
+  border: 0;
+  border-radius: 12px;
+  background: transparent;
+  color: var(--color-ink-3);
+  cursor: pointer;
+  text-decoration: none;
+  transition:
+    background 90ms ease,
+    color 90ms ease;
+}
+.rail-btn:hover {
+  background: var(--color-hover);
+  color: var(--color-ink);
+}
+.rail-btn[data-active='true'] {
+  background: #fff;
+  color: #0a0a0a;
+}
+
+/* Segmented pill control --------------------------------------------------- */
+.seg {
+  display: inline-flex;
+  gap: 2px;
+  padding: 3px;
+  background: var(--color-raised);
+  border: 1px solid var(--color-line);
+  border-radius: 999px;
+}
+.seg button {
+  padding: 5px 13px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--color-ink-2);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  white-space: nowrap;
+  transition:
+    background 90ms ease,
+    color 90ms ease;
+}
+.seg button:hover {
+  color: var(--color-ink);
+}
+.seg button[aria-pressed='true'] {
+  background: #fff;
+  color: #0a0a0a;
+}
+
+/* Status / delta pills ----------------------------------------------------- */
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 9px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 18px;
+  white-space: nowrap;
+}
+
+.chip-input {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  background: var(--color-raised);
+  border: 1px solid var(--color-line);
+  border-radius: 999px;
+  color: var(--color-ink-2);
+  font-size: 13px;
+}
+
+:where(a, button, input, [tabindex]):focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+.n-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-line-strong) transparent;
+}
+.n-scroll::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+.n-scroll::-webkit-scrollbar-thumb {
+  background: var(--color-line-strong);
+  border-radius: 4px;
+}
+.n-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* Days outside the current month, in the calendar. */
+.hatched {
+  background-image: repeating-linear-gradient(
+    45deg,
+    rgba(255, 255, 255, 0.05) 0,
+    rgba(255, 255, 255, 0.05) 1px,
+    transparent 1px,
+    transparent 5px
+  );
+}

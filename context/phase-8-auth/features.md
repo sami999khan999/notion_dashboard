@@ -1,11 +1,46 @@
-# Phase 8 — Authentication (Log in with Notion) · Features
+# Phase 8 — Authentication (Password + Log in with Notion) · Features
+
+> **Revised 2026-08-16.** A **password gate is now the primary login path**; the
+> Notion OAuth flow described below is retained as a secondary path. Both issue
+> the same session, so everything in this document about sessions, cookies,
+> expiry, logout, and route guarding applies to both.
 
 This document catalogs the **capabilities** Phase 8 delivers and, crucially, the
 **security model** behind them. It is descriptive (what exists and why each
 control matters) rather than procedural (how to build it — see
 `implementation.md`).
 
-## The security model (read this first)
+## Two front doors, one session
+
+| | **Password** (primary) | **Notion OAuth** (secondary) |
+|---|---|---|
+| Proves | knowledge of one shared secret | identity of a real Notion account |
+| Gate | the password itself | the **allowlist** — *not* the OAuth step |
+| Stored as | PBKDF2-SHA256 hash + salt in `PASSWORD_HASH` | nothing; the access token is discarded |
+| Brute-force defence | IP rate limit in KV + 210k-iteration KDF | n/a |
+| Session created | `auth_method='password'`, `user_id='owner'` | `auth_method='notion'`, real user id/email |
+
+Both land on the same signed `sid` cookie and the same `sessions` row.
+`requireSession`, sliding expiry, and `POST /logout` never branch on which door
+was used.
+
+**The password is a weaker control than OAuth+allowlist** — it authenticates a
+string, not a person. That is an accepted trade for a single-user tool whose
+alternative is a URL anyone can open. It is *not* an argument for relaxing the
+allowlist on the OAuth path: an unguarded `/auth/callback` is a bypass straight
+around the password. Both doors stay locked, or the OAuth routes get deleted.
+
+### Password-path guarantees
+
+- **The plaintext is never stored anywhere** — not in `vars`, not in a secret.
+- **Constant-time verification**, so the digest comparison leaks no timing signal.
+- **IP rate limiting** via KV, keyed on `CF-Connecting-IP` (Cloudflare-set, not
+  client-spoofable), failing **closed** if KV is unavailable.
+- **One generic failure message** for both wrong-password and rate-limited, so
+  probing yields no information.
+- **POST only**, so the password never enters a URL, history, or referrer.
+
+## The OAuth security model
 
 Phase 8 gates the dashboard's `fetch()` routes behind human authentication. There
 are two independent ideas that are easy to conflate, so pin them down:

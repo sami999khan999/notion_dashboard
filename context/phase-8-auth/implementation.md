@@ -1,4 +1,10 @@
-# Phase 8 — Authentication (Log in with Notion) · Implementation
+# Phase 8 — Authentication (Password + Log in with Notion) · Implementation
+
+> **Revised 2026-08-16.** The **password gate (§A, at the end of this file) is the
+> primary login path**; the Notion OAuth flow documented in §§1–17 is retained as
+> a secondary path. Both issue the same session via the same `createSession` and
+> the same signed cookie, so §§3, 7, 8, 11 (cookies, session store, route guard,
+> logout) apply unchanged to both. Read §A alongside §§3 and 7.
 
 This document is the copy-pasteable reference for the auth gate: the `sessions`
 D1 table, the HMAC cookie helpers (Web Crypto), the allowlist enforcement
@@ -1004,6 +1010,301 @@ npx wrangler secret list
   locked down.
 - **Does not touch Phases 3–4.** The cron sync/alert pipeline and the internal
   `NOTION_TOKEN` are outside this phase and unchanged.
-- **New files:** `apps/worker/src/auth/{cookies,allowlist,state,notion-oauth,session,require-session}.ts`,
+- **New files:** `apps/worker/src/auth/{cookies,allowlist,state,notion-oauth,session,require-session,password}.ts`,
   routes `apps/worker/src/routes/{login,auth.callback,logout}.tsx`, the `sessions`
   table in `apps/worker/schema.sql`, and the env/vars/secrets additions.
+
+---
+
+# §A — The password gate (primary login path)
+
+Everything in §§1–17 stays true. This section adds a second front door that lands
+in exactly the same place: a row in `sessions` and a signed `sid` cookie.
+
+## A.1 Schema addition
+
+```sql
+-- Which door the session came through. Audit only — nothing branches on it.
+ALTER TABLE sessions ADD COLUMN auth_method TEXT DEFAULT 'notion';
+```
+
+For a password login, `user_id` is the constant `"owner"`, `email` /
+`workspace_id` / `name` are `NULL`, and `auth_method` is `'password'`.
+`requireSession` doesn't care.
+
+## A.2 Env additions
+
+```ts
+export interface Env {
+  // ...existing...
+  PASSWORD_HASH: string;   // secret — "pbkdf2$<iterations>$<saltB64url>$<hashB64url>"
+  LOGIN_RATE_LIMIT: string; // var — max attempts per window, e.g. "8"
+  LOGIN_RATE_WINDOW: string;// var — window seconds, e.g. "900"
+}
+```
+
+`PASSWORD_HASH` is a **secret**. The two rate-limit knobs are plain vars.
+
+## A.3 Hashing — `auth/password.ts`
+
+PBKDF2-SHA256 via Web Crypto. It's available on Workers, needs no dependency, and
+is deliberately slow.
+
+> ⚠️ **workerd caps PBKDF2 at 100,000 iterations.** Above it,
+> `crypto.subtle.deriveBits` throws `NotSupportedError: iteration counts above
+> 100000 are not supported`. Node's `pbkdf2Sync` has no such limit, so a higher
+> value produces a hash that verifies perfectly in every local test and then
+> fails **100% of real logins** — surfacing as "Incorrect password" for a
+> correct password. This bit us at 210,000 (the OWASP figure) and cost a long
+> debugging session, because the generic login error is indistinguishable from a
+> genuinely wrong password by design.
+>
+> Two lessons baked into the code: `verifyPassword` now **logs** the derivation
+> error instead of swallowing it in `catch { return false }`, and
+> `test/password.test.ts` asserts the generation constant stays at or below
+> `MAX_PBKDF2_ITERATIONS`.
+>
+> 100k is below current OWASP guidance. The compensating controls are the
+> per-IP login rate limiter and the fact that an offline attack requires first
+> compromising the Cloudflare account that stores the hash.
+
+```ts
+import { timingSafeEqual } from "./cookies";
+
+const ITERATIONS = 100_000; // workerd's hard ceiling — see note below
+const KEYLEN_BITS = 256;
+
+function b64url(buf: ArrayBuffer | Uint8Array): string {
+  const a = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+  let s = ""; for (const b of a) s += String.fromCharCode(b);
+  return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+function unb64url(s: string): Uint8Array {
+  const p = s.replace(/-/g, "+").replace(/_/g, "/");
+  const bin = atob(p + "=".repeat((4 - (p.length % 4)) % 4));
+  return Uint8Array.from(bin, (c) => c.charCodeAt(0));
+}
+
+async function derive(password: string, salt: Uint8Array, iterations: number): Promise<string> {
+  const key = await crypto.subtle.importKey(
+    "raw", new TextEncoder().encode(password), "PBKDF2", false, ["deriveBits"],
+  );
+  const bits = await crypto.subtle.deriveBits(
+    { name: "PBKDF2", hash: "SHA-256", salt, iterations }, key, KEYLEN_BITS,
+  );
+  return b64url(bits);
+}
+
+/** Generate a storable hash string. Run once, offline — see A.7. */
+export async function hashPassword(password: string): Promise<string> {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const hash = await derive(password, salt, ITERATIONS);
+  return `pbkdf2$${ITERATIONS}$${b64url(salt)}$${hash}`;
+}
+
+/** Verify a candidate against the stored "pbkdf2$iters$salt$hash" string. */
+export async function verifyPassword(candidate: string, stored: string): Promise<boolean> {
+  const parts = stored.split("$");
+  if (parts.length !== 4 || parts[0] !== "pbkdf2") return false;
+  const iterations = Number(parts[1]);
+  if (!Number.isFinite(iterations) || iterations < 1000) return false;
+  const actual = await derive(candidate, unb64url(parts[2]), iterations);
+  return timingSafeEqual(actual, parts[3]);   // never ===
+}
+```
+
+## A.4 Rate limiting — KV
+
+```ts
+/**
+ * Fixed-window counter keyed by IP. Returns false once the window's budget is
+ * spent. Fail-CLOSED: if KV is unavailable we refuse rather than let the limiter
+ * silently become a no-op.
+ */
+export async function checkRateLimit(env: Env, ip: string): Promise<boolean> {
+  const max = Number(env.LOGIN_RATE_LIMIT ?? 8);
+  const windowSec = Number(env.LOGIN_RATE_WINDOW ?? 900);
+  const bucket = Math.floor(Date.now() / (windowSec * 1000));
+  const key = `login:${ip}:${bucket}`;
+  try {
+    const n = Number((await env.FLAGS.get(key)) ?? 0);
+    if (n >= max) return false;
+    await env.FLAGS.put(key, String(n + 1), { expirationTtl: windowSec + 60 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+```
+
+KV is eventually consistent, so a determined attacker across many colo locations
+can exceed the budget somewhat. That is acceptable: the limiter exists to make
+online brute force impractical, and PBKDF2 at 210k iterations already caps
+throughput. Do not swap this for a D1 counter on the hot path — a write per
+attempt is exactly what an attacker wants.
+
+Client IP comes from `request.headers.get("CF-Connecting-IP")`, which Cloudflare
+sets and a client cannot spoof. Do **not** trust `X-Forwarded-For`.
+
+## A.5 Route — `GET/POST /login`
+
+`/login` now serves a form on GET and verifies on POST. The OAuth entry point
+moves to `GET /login/notion` (§9's handler, renamed) so the two don't collide.
+
+```ts
+import { createServerFileRoute } from "@tanstack/react-start/server";
+import { verifyPassword, checkRateLimit } from "../auth/password";
+import { createSession } from "../auth/session";
+import { signValue, serializeCookie, SESSION_COOKIE } from "../auth/cookies";
+
+const SESSION_MAX_AGE = 30 * 24 * 60 * 60;
+
+function loginPage(error?: string): Response {
+  const msg = error
+    ? `<p style="color:#f87171;margin:0 0 12px;font-size:14px">${error}</p>` : "";
+  return new Response(
+    `<!doctype html><meta charset="utf-8"><title>Sign in</title>
+<style>body{font-family:system-ui,sans-serif;background:#0d0f14;color:#e6e8ee;
+display:grid;place-items:center;height:100vh;margin:0}
+.card{width:20rem;padding:2rem;border:1px solid #232a36;border-radius:12px;background:#161a22}
+input,button{width:100%;padding:.6rem;margin:.25rem 0;border-radius:8px;
+border:1px solid #232a36;background:#0d0f14;color:#e6e8ee;font-size:14px;box-sizing:border-box}
+button{background:#2563eb;border-color:#2563eb;cursor:pointer;margin-top:12px}
+a{color:#6ea8fe;font-size:13px}</style>
+<div class="card"><h1 style="font-size:1.1rem;margin:0 0 1rem">Notion Ops</h1>${msg}
+<form method="POST" action="/login">
+<input type="password" name="password" placeholder="Password" autofocus
+       autocomplete="current-password" required>
+<button type="submit">Sign in</button></form>
+<p style="margin:1rem 0 0"><a href="/login/notion">Log in with Notion instead</a></p>
+</div>`,
+    { status: error ? 401 : 200,
+      headers: { "Content-Type": "text/html; charset=utf-8",
+                 "Cache-Control": "no-store" } },
+  );
+}
+
+export const ServerRoute = createServerFileRoute("/login").methods({
+  GET: async () => loginPage(),
+
+  POST: async ({ request, context }) => {
+    const env = context.cloudflare.env as Env;
+    const ip = request.headers.get("CF-Connecting-IP") ?? "unknown";
+
+    // Rate limit BEFORE doing the expensive KDF — otherwise the limiter itself
+    // becomes the CPU-exhaustion vector.
+    if (!(await checkRateLimit(env, ip))) {
+      console.warn(JSON.stringify({ event: "auth.ratelimited", ip }));
+      return loginPage("Incorrect password.");   // deliberately identical message
+    }
+
+    const form = await request.formData();
+    const password = String(form.get("password") ?? "");
+    if (!password || !(await verifyPassword(password, env.PASSWORD_HASH))) {
+      console.warn(JSON.stringify({ event: "auth.failed", method: "password", ip }));
+      return loginPage("Incorrect password.");
+    }
+
+    const sessionId = await createSession(env, {
+      userId: "owner", email: null, workspaceId: null, name: null,
+    }, "password");
+
+    const cookie = serializeCookie(
+      SESSION_COOKIE, await signValue(sessionId, env.SESSION_SECRET),
+      { maxAge: SESSION_MAX_AGE, httpOnly: true, secure: true, sameSite: "Lax", path: "/" },
+    );
+    console.log(JSON.stringify({ event: "auth.success", method: "password", ip }));
+    return new Response(null, { status: 302, headers: { Location: "/", "Set-Cookie": cookie } });
+  },
+});
+```
+
+`createSession` from §7 gains one optional parameter:
+
+```ts
+export async function createSession(
+  env: Env, identity: Identity, method: "password" | "notion" = "notion",
+): Promise<string> {
+  // ...unchanged INSERT, with auth_method bound to `method`...
+}
+```
+
+> **`SameSite=Lax` is required, not `Strict`.** The OAuth path needs to survive
+> the top-level redirect back from Notion. Since both paths share one cookie, Lax
+> it is. The password POST is same-site anyway, so nothing is lost.
+
+## A.6 Everything downstream is unchanged
+
+`requireSession` (§8), `getSession` sliding refresh (§7), `POST /logout` (§11),
+and the `/test-push` lockdown (§12) all work as written. They read the `sid`
+cookie and the `sessions` row and never inspect `auth_method`.
+
+The only edit: §8's redirect target `/login` now lands on the password form
+instead of bouncing straight to Notion — which is the intended behaviour.
+
+## A.7 Generating and setting the hash
+
+Run this once locally to turn your chosen password into a storable hash. It uses
+Node's built-in `crypto` and prints the exact string to store:
+
+```js
+// scripts/hash-password.mjs  —  node scripts/hash-password.mjs 'your password'
+import { pbkdf2Sync, randomBytes } from "node:crypto";
+const ITER = 100_000; // MUST match src/auth/password.ts
+const pw = process.argv[2];
+if (!pw) { console.error("usage: node hash-password.mjs '<password>'"); process.exit(1); }
+const salt = randomBytes(16);
+const hash = pbkdf2Sync(pw, salt, ITER, 32, "sha256");
+const b64 = (b) => b.toString("base64").replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,"");
+console.log(`pbkdf2$${ITER}$${b64(salt)}$${b64(hash)}`);
+```
+
+The output is byte-compatible with `verifyPassword` above — same KDF, same
+iteration count, same base64url encoding of a 32-byte key.
+
+```powershell
+node scripts/hash-password.mjs 'your password here'
+# paste the pbkdf2$... output when prompted:
+npx wrangler secret put PASSWORD_HASH
+```
+
+Use the **interactive** form so neither the password nor the hash lands in
+PowerShell history. Add to `.dev.vars` (gitignored) for local dev.
+
+Rotating the password is one re-`put`. Existing sessions survive it — to force
+re-login, `DELETE FROM sessions`.
+
+## A.8 Verification
+
+| Criterion | Test |
+|---|---|
+| Logged-out redirect | Incognito, open `/` → 302 to `/login`, password form renders, no dashboard HTML. |
+| Correct password | Submit it → 302 to `/`, dashboard renders, `sid` cookie is HttpOnly+Secure+Lax, one `sessions` row with `auth_method='password'`. |
+| Wrong password | Submit garbage → 401, same generic "Incorrect password.", **no** `sessions` row. |
+| Rate limit | Submit wrong passwords `LOGIN_RATE_LIMIT + 1` times → the last is refused with the *identical* message; log shows `auth.ratelimited`. |
+| KV down ⇒ fail closed | Temporarily break the `FLAGS` binding → login refuses rather than allowing unlimited attempts. |
+| Hash only | `npx wrangler secret list` shows `PASSWORD_HASH`; grep the repo for the plaintext → zero hits. |
+| Forged cookie | Flip a character in `sid` → redirect to `/login`. |
+| Logout | `POST /logout` → 302, cookie cleared, `sessions` row deleted. |
+| OAuth still gated | With `ALLOWED_EMAILS` set to someone else, `/login/notion` still ends in the 403 page. Adding the password did not open a bypass. |
+| Cron unaffected | `wrangler tail` a scheduled run — sync and alerts run with no cookie. |
+
+## A.9 Pitfalls specific to the password path
+
+1. **Never store the plaintext.** Not in `vars`, not in a secret, not in
+   `.dev.vars` committed by accident. Only the PBKDF2 string.
+2. **Rate limit before hashing.** 210k PBKDF2 iterations per request is a CPU
+   amplification attack if an unauthenticated caller can trigger it freely.
+3. **The failure message must be identical** for wrong-password and
+   rate-limited. Different text tells an attacker their probing is working.
+4. **Fail closed when KV errors.** A limiter that degrades to "allow" under load
+   is worse than none, because you'll believe it's protecting you.
+5. **`CF-Connecting-IP`, never `X-Forwarded-For`.** The latter is client-supplied
+   and trivially spoofed, which turns a per-IP limiter into no limiter.
+6. **Adding the password does not retire the OAuth allowlist.** `/auth/callback`
+   remains a live entry point. Keep it fail-closed, or delete the OAuth routes
+   entirely.
+7. **POST, never GET, for the password.** A GET puts it in the URL, browser
+   history, and any log or referrer header along the way.
+8. **`Cache-Control: no-store` on the login page.** Otherwise an intermediary or
+   the browser may cache a page rendered mid-flow.

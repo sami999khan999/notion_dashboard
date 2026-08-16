@@ -1,0 +1,33 @@
+# Local dev secrets. Copy to `.dev.vars` (gitignored) and fill in.
+# Production values are set separately with `wrangler secret put <NAME>`.
+
+# Notion internal integration token (service identity for the cron sync).
+NOTION_TOKEN=ntn_xxxxxxxxxxxxxxxxxxxx
+
+# --- Email channel ----------------------------------------------------------
+# EMAIL_PROVIDER is a var in wrangler.jsonc: "smtp" (default) or "resend".
+#
+# SMTP works from Workers. Cloudflare blocks outbound port 25 only; submission
+# ports 587 (STARTTLS) and 465 (implicit TLS) connect fine. Nodemailer still
+# does NOT work — we speak the protocol directly in src/alerts/smtp.ts.
+
+# Gmail: requires 2-Step Verification, then an App Password from
+# https://myaccount.google.com/apppasswords  (16 chars, spaces are fine).
+# Your normal Google password will NOT work.
+SMTP_USER=you@gmail.com
+SMTP_PASS=xxxxxxxxxxxxxxxx
+
+ALERT_FROM=Notion Ops <you@gmail.com>
+ALERT_TO=you@gmail.com
+
+# Only needed when EMAIL_PROVIDER=resend.
+RESEND_API_KEY=
+
+# --- Auth -------------------------------------------------------------------
+# Dashboard password, stored ONLY as a PBKDF2 hash.
+# Generate with:  pnpm hash-password 'your password here'
+PASSWORD_HASH=pbkdf2$210000$xxxxxxxx$xxxxxxxx
+
+# HMAC key for signing session cookies. Any long random string.
+# Generate with:  node -e "console.log(require('crypto').randomBytes(48).toString('base64url'))"
+SESSION_SECRET=replace-with-a-long-random-string

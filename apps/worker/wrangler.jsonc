@@ -1,0 +1,87 @@
+/**
+ * Notion Ops Dashboard — Worker config.
+ *
+ * `main` points at our own entry (src/worker.ts) rather than the default
+ * `@tanstack/react-start/server-entry`, because we need a `scheduled()` handler
+ * for the cron alongside TanStack Start's `fetch()`.
+ *
+ * Secrets are NOT here — set them with `wrangler secret put`:
+ *   NOTION_TOKEN, RESEND_API_KEY, ALERT_FROM, ALERT_TO,
+ *   PASSWORD_HASH, SESSION_SECRET
+ */
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "notion-ops",
+  "compatibility_date": "2025-09-02",
+  "compatibility_flags": ["nodejs_compat"],
+  "main": "src/worker.ts",
+  "observability": { "enabled": true },
+  "upload_source_maps": true,
+
+  // Cron: every minute. The sync + alert pipeline is incremental and cheap.
+  "triggers": { "crons": ["* * * * *"] },
+
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "notion-ops",
+      "database_id": "85283c6d-d893-42fd-b9e6-264e7820ad69"
+    }
+  ],
+
+  "kv_namespaces": [{ "binding": "FLAGS", "id": "6f0388b3b8c0419ebd0450206d3af20d" }],
+
+  "vars": {
+    // --- Notion data sources (see context/notion-schema.md §1) --------------
+    // Query these on Notion-Version 2025-09-03 via /v1/data_sources/{id}/query.
+    // The classic /v1/databases/{id}/query endpoint 400s on Daily Routine,
+    // which has five data sources.
+    "DS_ROUTINE": "2bc82224-6217-81a2-9b52-000b6c7526b1",
+    "DS_TASKS": "2c082224-6217-8061-a75e-000b079c1160",
+    "DS_TIMER": "2c182224-6217-80f9-b47a-000b36ded62a",
+
+    // --- Time zone ----------------------------------------------------------
+    // Asia/Dhaka, +06:00, no DST. Every Notion datetime carries this offset.
+    "ALERT_TZ_OFFSET_MINUTES": "360",
+
+    // --- Alert engine tuning ------------------------------------------------
+    "ALERT_MAX_LATENESS_MIN": "10",
+    "ALERT_DEADLINE_STALE_HOURS": "24",
+    "ALERT_MISSED_GRACE_MIN": "60",
+    "ALERT_QUIET_HOURS": "",
+    "DIGEST_AT": "07:45",
+
+    // --- Rule switches (E1-E9) ---------------------------------------------
+    "ALERT_TIMER_START": "true",
+    "ALERT_TIMER_TICK": "true",
+    "ALERT_TIMER_TICK_MINUTES": "30",
+    "ALERT_TIMER_END": "true",
+    "ALERT_DEADLINE_24H": "true",
+    "ALERT_DEADLINE_1H": "true",
+    "ALERT_DEADLINE_HIT": "true",
+    "ALERT_DEADLINE_MISSED": "true",
+    "ALERT_DEADLINE_MISSED_RENAG": "true",
+    "ALERT_ROUTINE_START": "true",
+    "ALERT_ROUTINE_DIGEST": "false",
+
+    // --- Email channel ------------------------------------------------------
+    // "smtp" (default) or "resend".
+    // SMTP works from Workers on submission ports: Cloudflare blocks outbound
+    // port 25 only, and 587/465 connect fine (verified against smtp.gmail.com).
+    // Nodemailer still does NOT work — see src/alerts/smtp.ts.
+    "EMAIL_PROVIDER": "smtp",
+    "SMTP_HOST": "smtp.gmail.com",
+    "SMTP_PORT": "587",
+
+    // --- Mobile push --------------------------------------------------------
+    // The Firebase project id. Not a secret — the credential that can actually
+    // send is FCM_SERVICE_ACCOUNT, set via `wrangler secret put`.
+    // Push stays off unless BOTH are present, and the Worker keeps emailing.
+    "FCM_PROJECT_ID": "notion-ops-f6547",
+
+    // --- Auth ---------------------------------------------------------------
+    "LOGIN_RATE_LIMIT": "8",
+    "LOGIN_RATE_WINDOW": "900",
+    "ENVIRONMENT": "production"
+  }
+}

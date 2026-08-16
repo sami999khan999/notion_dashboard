@@ -1,6 +1,17 @@
 # Notion Ops Dashboard — Context
 
-This folder is the **source of truth** for building the Notion Ops Dashboard: a single Cloudflare Worker (TanStack Start app) that polls a Notion workspace every minute, detects status conditions across Daily Routine / Tasks / Time Tracker / Transactions / Goals, pushes alerts to a Flutter app via FCM (with optional email), and serves a live dashboard. State is persisted in D1.
+> **Revised 2026-08-16 — the plan changed.** This is now a **personal,
+> single-user** tool. **Email is the only notification channel**; push/FCM and the
+> Flutter app (Phase 6) are **deferred**. The dashboard is gated by a
+> **password** (Notion OAuth retained as an alternative). The alert rule set was
+> rewritten around timer lifecycle, task deadlines, and routine block starts.
+>
+> **Read [`notion-schema.md`](./notion-schema.md) first.** It is the verified,
+> API-captured property reference for the three live databases, and it corrects
+> several errors that earlier drafts of this README and `overview.md` were built
+> on — including one that would have made routine alerts silently never fire.
+
+This folder is the **source of truth** for building the Notion Ops Dashboard: a single Cloudflare Worker (TanStack Start app) that polls a Notion workspace every minute, detects conditions across Daily Routine / Tasks / Time Tracker (with Transactions / Goals synced for display), emails alerts, and serves a live dashboard. State is persisted in D1.
 
 Each phase has its own folder with three documents:
 
@@ -16,22 +27,25 @@ Read the phase's `goals.md` first (what "done" means), then `features.md` (what 
 
 ```
 Cloudflare Worker (backend)
-├── fetch()      → TanStack Start SSR app + /register route + route loaders (reads D1)
+├── fetch()      → TanStack Start SSR app, password-gated
+│                   /login (form) · /login/notion · /auth/callback · /logout
+│                   dashboard route loaders (read D1)
 └── scheduled()  → cron "* * * * *"
-       ├── 1. Notion incremental pull (last_edited_time cursor)
-       ├── 2. Normalize pages → rows, upsert into D1
-       ├── 3. Run alert rules against fresh D1 snapshot
-       ├── 4. Push un-sent alerts → FCM (→ Flutter app) / email
-       └── 5. Advance sync cursor
+       ├── 1. Snapshot previous timer state (for edge detection)
+       ├── 2. Notion pull — incremental for Tasks + Time Tracker,
+       │        FULL for Daily Routine (formulas don't bump last_edited_time)
+       ├── 3. Normalize pages → rows, upsert into D1
+       ├── 4. Run alert rules E1–E9 against the fresh snapshot
+       ├── 5. Email un-sent alerts (SMTP or Resend), log to alert_log
+       └── 6. Advance sync cursor (with ~2 min overlap)
 
-Flutter app (phone — receive-only)
-├── registers FCM device token → POST /register
-└── receives pushes (foreground + background), shows notification
-
-Bindings: D1 (state + history + device tokens), KV (alert dedupe / token cache), Secrets (tokens)
+Bindings: D1 (snapshots + sessions + alert history), KV (login rate limit),
+          Secrets (NOTION_TOKEN, SMTP_USER/SMTP_PASS, PASSWORD_HASH, SESSION_SECRET)
 ```
 
-Both Worker handlers share the same bindings. The Flutter app is a thin client: it registers its push token and displays whatever the Worker sends — all logic stays server-side.
+Both Worker handlers share the same bindings. All alert logic is server-side; the
+dashboard is **read-only** (see `notion-schema.md` §6 — the Notion `Start`/`Pause`
+buttons cannot be pressed via the API).
 
 ---
 
@@ -78,35 +92,52 @@ notion_dashboard/
 └── README.md
 ```
 
+`apps/mobile/` is the Android app (Phase 6). It receives the same alerts as push
+notifications, signs in with the same password against `/api/*`, and lets you
+toggle notifications and vibration per device. It needs a `google-services.json`
+from your own Firebase project — see `apps/mobile/README.md`.
+
 **Conventions**
-- Package manager: `pnpm` workspaces (or npm workspaces) rooted at repo top for the JS side; Flutter is managed by its own `pubspec.yaml` under `apps/mobile`.
-- Secrets never committed: `NOTION_TOKEN`, `FCM_SERVICE_ACCOUNT`, `RESEND_API_KEY`, `ALERT_FROM`, `ALERT_TO` go through `wrangler secret put`; `.dev.vars` for local dev is gitignored. `google-services.json` and any `.p8` / service-account JSON are gitignored.
-- `Notion-Version` header pinned to `2022-06-28` (classic database-query endpoint keyed by 32-char database ID).
-- All timestamps stored as ISO 8601 strings (UTC) in D1.
+- Package manager: `pnpm` workspaces (or npm workspaces) rooted at repo top.
+- Secrets never committed: `NOTION_TOKEN`, `SMTP_USER`, `SMTP_PASS` (or `RESEND_API_KEY`), `ALERT_FROM`, `ALERT_TO`, `PASSWORD_HASH`, `SESSION_SECRET` go through `wrangler secret put`; `.dev.vars` for local dev is gitignored.
+- **`Notion-Version` pinned to `2025-09-03`**, querying `POST /v1/data_sources/{id}/query`. The classic `2022-06-28` database endpoint **400s on Daily Routine**, which has five data sources. Use one endpoint for all databases.
+- All timestamps stored as ISO 8601 **UTC** in D1. Local wall-clock (`Asia/Dhaka`, fixed **+06:00**, no DST) is used only for routine windows, day boundaries, and display.
 
 ---
 
 ## Notion databases (config)
 
-| Database | Database ID (var) | Env var |
-|---|---|---|
-| Daily Routine Planner | `2bc82224621781b5b3d1e435e7f9dabf` | `DB_ROUTINE` |
-| Tasks | `2c082224621780738f64fe38401f8460` | `DB_TASKS` |
-| Time Tracker | `2c18222462178014a1cfdff168501bb1` | `DB_TIMER` |
-| Transactions | `cfe3d0b2968f499cbd0774e8f6c4e09f` | `DB_TXN` |
-| Goals | `be4a4954aa374e57928173258a68f15a` | `DB_GOALS` |
+Query by **data-source ID** on `Notion-Version: 2025-09-03`. Database IDs are kept
+for reference and for `GET /v1/databases/{id}`.
 
-**Property names are exact-match and several contain typos that must be preserved verbatim:** `Day Cateogry`, `Summery`, and the status value `Stoped`. Formula / rollup / status fields (`Active Now`, `Task Progress`, `Total Time In Seconds`, `Status`, `Signed`, `Schedule Status`, `Time Remains`, `Today`) are **read-only** — read under `.formula` / `.rollup` / `.status`, never write.
+| Database | Data-source ID (query this) | Database ID | Env var |
+|---|---|---|---|
+| Daily Routine Planner | `2bc82224-6217-81a2-9b52-000b6c7526b1` | `2bc82224621781b5b3d1e435e7f9dabf` | `DS_ROUTINE` |
+| Tasks | `2c082224-6217-8061-a75e-000b079c1160` | `2c082224621780738f64fe38401f8460` | `DS_TASKS` |
+| Time Tracker | `2c182224-6217-80f9-b47a-000b36ded62a` | `2c18222462178014a1cfdff168501bb1` | `DS_TIMER` |
+| Transactions | `4aa375e0-4e19-4b48-a639-850786543875` | `cfe3d0b2968f499cbd0774e8f6c4e09f` | `DS_TXN` |
+| Goals | `93a3a8d9-ed49-4c95-b0da-39b4c93dadfd` | `be4a4954aa374e57928173258a68f15a` | `DS_GOALS` |
+
+> Daily Routine's database contains **four additional empty data sources** beyond
+> the real one. Query the ID above specifically — see `notion-schema.md` §1.
+
+**Property names are exact-match and several contain typos that must be preserved verbatim:** `Day Cateogry`, `Summery`, the status value `Stoped`, and the relation `Project Plans ` (trailing space). Formula / rollup / status fields are **read-only** — read under `.formula` / `.rollup` / `.status`, never write.
+
+**Three traps worth internalising** (full detail in `notion-schema.md`):
+
+1. **Formulas never bump `last_edited_time`.** `Active Now` flipping to Active produces no edit event, so an incremental pull will never see it. Routine triggers are computed **locally** from `Time` + `Days` + timezone.
+2. **`Total Time In Seconds` is `0` while a timer runs.** Compute elapsed as `now − Start Time`.
+3. **Time Tracker's `Status` groups are miswired** — `Running` sits under "Complete". Filter by option name, never by group. And **Tasks `Status` is dead data**: all 359 rows are `Stoped`.
 
 ---
 
 ## Build order
 
 ```
-0 → 1 → 2 → 3 → (4 ∥ 5) → 6 → 7 → 8
+0 → 1 → 2 → 3 → (4 ∥ 5) → 8 → 7 → 6
 ```
 
-The backend, alerts, and dashboard are fully working before the Flutter app exists. Phase 4 alerts run against a **stub `pushFcm`** that logs to `alert_log`, so every rule can be verified without a phone. Phase 6 swaps the stub for the real FCM sender. Phases 4 (alerts) and 5 (dashboard) both read the D1 mirror, so they parallelize once Phase 3 lands. Phase 8 (auth) runs after the dashboard exists (Phase 5) and guards its routes; it can be slotted in earlier if you want the login wall before shipping.
+Phase 4 (alerts) and Phase 5 (dashboard) both read the D1 mirror, so they parallelize once Phase 3 lands. Phase 8 (auth) now runs **before** Phase 7 — the dashboard shouldn't sit on a public URL unguarded while you harden it. Phase 6 (Flutter + FCM) is **deferred**: email covers the notification requirement, and the `Alert` shape already carries everything a push would need if it's revived.
 
 | Phase | Scope | Est. |
 |---|---|---|
@@ -114,11 +145,13 @@ The backend, alerts, and dashboard are fully working before the Flutter app exis
 | 1 | Notion client + normalizers | 1 day |
 | 2 | D1 schema | ½ day |
 | 3 | Sync engine | 1 day |
-| 4 | Alert engine + channels | 1–1.5 days |
+| 4 | Alert engine + email (E1–E9) | 1–1.5 days |
 | 5 | Dashboard UI + charts | 1.5 days |
-| 6 | Flutter app + FCM pipeline | 1.5–2 days |
+| 8 | Auth — password + Notion OAuth | ½–1 day |
 | 7 | Hardening | ½–1 day |
-| 8 | Authentication (Log in with Notion) | ½–1 day |
-| | **Total** | **~8–10 days** |
+| 6 | Flutter app + FCM push | **built** |
+| | **Total** | **~6.5–8 days** |
 
-**Auth model (Phase 8):** the dashboard is gated by "Log in with Notion" — Notion OAuth for identity, enforced against a **workspace-ID + email allowlist**. Notion has no API to list who can access a database, so workspace membership is the practical proxy for "whoever has access to the databases." The allowlist is the real security control (anyone can authorize a public integration). The cron uses a separate **internal** integration and is unaffected.
+**Notification model (Phase 4):** email only, via **SMTP** (default) or the **Resend HTTP API**, selected with `EMAIL_PROVIDER`. SMTP genuinely works on Workers — Cloudflare blocks outbound port 25 only, while 587/465 connect fine through `cloudflare:sockets`; Nodemailer still does not work, so the protocol is spoken directly. Nine rules: timer started / still-running every 30 min / ended (E1–E3), deadline at 24h / 1h / hit / missed (E4–E7), and routine block start (E8) with an optional daily digest (E9). Expect **~35–45 emails on a typical weekday** and **zero on Fri/Sat** (all Fri/Sat routine rows are archived). Every rule is individually switchable, and `ALERT_QUIET_HOURS` mutes a local window without touching rule code.
+
+**Auth model (Phase 8):** a **password gate** is the primary door — one password stored as a **PBKDF2-SHA256 hash** in a Worker secret, constant-time verified, IP rate-limited via KV. **"Log in with Notion"** is retained as a secondary door, still enforced against a **workspace-ID + email allowlist** (a successful OAuth proves only that the visitor has *a* Notion account — the allowlist is the real control). Both doors issue the same session, so `requireSession`, logout, and expiry are shared. The cron uses the separate **internal** integration and is unaffected by either.
